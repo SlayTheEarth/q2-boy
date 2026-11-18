@@ -746,7 +746,7 @@ static void draw_ui(void) {
     switch (screen) {
     case GAME: draw_game(); break;
     case BROWSER: {
-        header("GBA", rom_count ? "Choose a cartridge" : "Copy .gb, .gbc or .gba files to GBA/ROMs on the SD card");
+        header("QEMU2-pod", rom_count ? "Choose a cartridge" : "Copy .gb, .gbc or .gba files to GBA/ROMs on the SD card");
         int start = (selection / ROWS) * ROWS;
         for (int i = 0; i < ROWS && start + i < rom_count; ++i)
             row(i, roms[start + i], start + i == selection);
@@ -1379,7 +1379,7 @@ static void log_launch(void) {
     sigaction(SIGSEGV, &action, NULL);
     sigaction(SIGABRT, &action, NULL);
     sigaction(SIGFPE, &action, NULL);
-    fprintf(stderr, "\nQ2 GBA 0.2.0, engine=%s\n",
+    fprintf(stderr, "\nQEMU2-pod 0.2.1, engine=%s\n",
             use_dynarec ? "dynamic recompiler (opt-in)" : "interpreter");
     FILE *memory = fopen("/proc/meminfo", "r");
     if (memory) {

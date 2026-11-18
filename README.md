@@ -1,7 +1,7 @@
-# Q2 GBA
+# QEMU2-pod
 
 A native Game Boy, Game Boy Color, and Game Boy Advance emulator frontend
-for the Shanling Q2 running Q2-Pod. It installs under **Library → Games → GBA**.
+for the Shanling Q2 running Q2-Pod. It installs under **Library → Games → QEMU2-pod**.
 The ROM picker runs `.gb` and `.gbc` with [Gambatte](https://github.com/libretro/gambatte)
 and `.gba` with [gpSP](https://github.com/libretro/gpsp) automatically.
 All three share the same controls, menus, display options, save slots, and
@@ -14,13 +14,13 @@ and access to the firmware's native Now Playing screen use the bridge in
 
 ## Install on the Q2
 
-1. Download `Q2_GBA_v0.2.0.zip` from [Releases](https://github.com/SlayTheEarth/q2-gba/releases/latest).
+1. Download `QEMU2-pod_v0.2.1.zip` from [Releases](https://github.com/SlayTheEarth/q2-gba/releases/latest).
    Extract it and copy the packaged `.gba` directory to the root of the SD
    card. Enable hidden files if your file manager hides the directory.
 2. Copy your `.gb`, `.gbc`, and `.gba` ROM files into `GBA/ROMs` on the same card.
-3. Open **Library → Games → GBA**. Upgrading only requires replacing the
-   two existing app files and adding `gambatte_libretro.so` in `.gba`. Keep the
-   existing `GBA` folder with your ROMs, saves, save states, and settings.
+3. Open **Library → Games → QEMU2-pod**. Replace the three files in `.gba`
+   when upgrading. Keep the existing `GBA` folder with your ROMs, saves,
+   save states, and settings.
 
 The ZIP's `Source` folder is for rebuilding the app. Only `.gba` goes on
 the SD card when installing the app.
