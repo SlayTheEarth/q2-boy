@@ -16,7 +16,7 @@ Firmware with that bridge keeps music already playing when q2-boy opens.
 
 ## Install on the Q2
 
-1. Download `q2-boy_v0.2.2.zip` from [Releases](https://github.com/SlayTheEarth/q2-boy/releases/latest).
+1. Download the latest q2-boy ZIP from [Releases](https://github.com/SlayTheEarth/q2-boy/releases/latest).
    Extract it and copy the packaged `.boy` directory to the root of the SD
    card. Enable hidden files if your file manager hides the directory.
 2. Copy your `.gb`, `.gbc`, and `.gba` ROM files into `q2-boy/ROMs` on the same card.
@@ -25,10 +25,6 @@ Firmware with that bridge keeps music already playing when q2-boy opens.
 
 The ZIP's `Source` folder is for rebuilding the app. Only `.boy` goes on
 the SD card when installing the app.
-
-The v0.2.2 ZIP uses the previous Games menu label, **q2-boy**. To switch to
-**Pocket Boy** on an existing install, replace `.boy/q2app` on the SD card
-with the [current q2app file](https://raw.githubusercontent.com/SlayTheEarth/q2-boy/main/package/Copy-to-SD/.boy/q2app).
 
 When upgrading, first move the old hidden launcher folder off the card.
 On first launch q2-boy moves the previous data folder into `q2-boy` if
