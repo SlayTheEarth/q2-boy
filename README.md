@@ -3,7 +3,7 @@
 <img src="assets/mascot.png" width="220" alt="Pixel-art q2-boy mascot holding a click-wheel player">
 
 A native Game Boy, Game Boy Color, and Game Boy Advance emulator frontend
-for the Shanling Q2 running Q2-Pod. It installs under **Library → Games → q2-boy**.
+for the Shanling Q2 running Q2-Pod. It appears as **Pocket Boy** in **Library → Games**.
 The ROM picker runs `.gb` and `.gbc` with [Gambatte](https://github.com/libretro/gambatte)
 and `.gba` with [gpSP](https://github.com/libretro/gpsp) automatically.
 All three share the same controls, menus, display options, save slots, and
@@ -20,11 +20,15 @@ Firmware with that bridge keeps music already playing when q2-boy opens.
    Extract it and copy the packaged `.boy` directory to the root of the SD
    card. Enable hidden files if your file manager hides the directory.
 2. Copy your `.gb`, `.gbc`, and `.gba` ROM files into `q2-boy/ROMs` on the same card.
-3. Open **Library → Games → q2-boy**. On a fresh install the app creates
+3. Open **Library → Games → Pocket Boy**. On a fresh install the app creates
    the `q2-boy` data folder at first launch.
 
 The ZIP's `Source` folder is for rebuilding the app. Only `.boy` goes on
 the SD card when installing the app.
+
+The v0.2.2 ZIP uses the previous Games menu label, **q2-boy**. To switch to
+**Pocket Boy** on an existing install, replace `.boy/q2app` on the SD card
+with the [current q2app file](https://raw.githubusercontent.com/SlayTheEarth/q2-boy/main/package/Copy-to-SD/.boy/q2app).
 
 When upgrading, first move the old hidden launcher folder off the card.
 On first launch q2-boy moves the previous data folder into `q2-boy` if
