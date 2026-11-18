@@ -40,10 +40,10 @@ typedef struct { int x, y, size, opacity, visible; unsigned keys; const char *la
 #define VERTICAL_INSET 5
 #define DEFAULT_OPACITY 70
 static const Button defaults[CONTROLS] = {
-    {38, 5, 72, DEFAULT_OPACITY, 1, KEY(L), "L"},
-    {265, 5, 72, DEFAULT_OPACITY, 1, KEY(R), "R"},
+    {29, 5, 72, DEFAULT_OPACITY, 1, KEY(L), "L"},
+    {274, 5, 72, DEFAULT_OPACITY, 1, KEY(R), "R"},
     {297, 244, 60, DEFAULT_OPACITY, 1, KEY(B), "B"},
-    {43, 272, 62, DEFAULT_OPACITY, 1, 0, "Menu"},
+    {34, 272, 62, DEFAULT_OPACITY, 1, 0, "Menu"},
     {66, 222, 44, DEFAULT_OPACITY, 0, 0, "FF"},
     {122, 208, 44, DEFAULT_OPACITY, 0, 0, "Save"},
     {174, 208, 44, DEFAULT_OPACITY, 0, 0, "Load"},
@@ -59,6 +59,9 @@ static const Button defaults[CONTROLS] = {
 static const int old_default_positions[CONTROLS][2] = {
     [L] = {18, 16}, [R] = {285, 16}, [MENU_BUTTON] = {18, 260}, [SPEED] = {88, 260},
     [SELECT_BUTTON] = {126, 268}, [START_BUTTON] = {192, 268}
+};
+static const int test_default_positions[CONTROLS][2] = {
+    [L] = {38, 5}, [R] = {265, 5}, [MENU_BUTTON] = {43, 272}
 };
 static const int old_default_opacity[CONTROLS] = {
     58, 58, 58, 65, 65, 65, 65, 58, 65, 65, 62, 62, 62, 62, 62
@@ -421,7 +424,7 @@ static void audio_poll(uint64_t now) {
 }
 static void store_config(void) {
     char buffer[768];
-    int used = snprintf(buffer, sizeof buffer, "%d 7 %d %d\n", scaling, fast_rate, local_volume);
+    int used = snprintf(buffer, sizeof buffer, "%d 8 %d %d\n", scaling, fast_rate, local_volume);
     for (int i = 0; i < CONTROLS; ++i) {
         const Button *b = &buttons[i];
         used += snprintf(buffer + used, sizeof buffer - used, "%d %d %d %d %d %u\n",
@@ -469,6 +472,9 @@ static void load_config(void) {
             if (size == b->size && x == old_default_positions[which][0] &&
                 y == old_default_positions[which][1]) { x = b->x; y = b->y; }
             if (alpha == old_default_opacity[which]) alpha = b->opacity;
+        } else if (version == 7 && size == b->size &&
+                   x == test_default_positions[which][0] && y == test_default_positions[which][1]) {
+            x = b->x;
         }
         b->size = clamp(size, 36, 88);
         move_button(which, x, y);
