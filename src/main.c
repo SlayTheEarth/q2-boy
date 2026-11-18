@@ -85,8 +85,8 @@ static const int legacy_geometry[][3] = {
 static const int previous_overlays[] = {L, R, -1, B, MENU_BUTTON, SPEED, QUICK_SAVE, QUICK_LOAD, AB};
 static const int speeds[] = {2, 3};
 static int fast_rate = 2;
-#define AUDIO_REQUEST "/tmp/q2-gba.audio.req"
-#define AUDIO_REPLY "/tmp/q2-gba.audio.reply"
+#define AUDIO_REQUEST "/tmp/q2-boy.audio.req"
+#define AUDIO_REPLY "/tmp/q2-boy.audio.reply"
 #define AUDIO_MAGIC 0x51474131u
 enum AudioAction { AUDIO_GAME = 1, AUDIO_MUSIC, AUDIO_VOLUME, AUDIO_PREVIOUS, AUDIO_PLAY, AUDIO_NEXT, AUDIO_NOW_PLAYING };
 struct AudioCommand { uint32_t magic, seq; int32_t action, value; };
@@ -111,7 +111,7 @@ static enum Action confirm_action;
 static uint64_t wheel_time, notice_end, next_save;
 static unsigned physical_keys, touch_keys, pressed_this_frame;
 static char notice[95];
-static const char *data_dir = "/mnt/mmc/GBA";
+static const char *data_dir = "/mnt/mmc/q2-boy";
 static char rom_dir[PATH_CAP], save_dir[PATH_CAP], game_base[PATH_CAP], config_file[PATH_CAP];
 static char roms[ROM_LIMIT][256];
 static int rom_count;
@@ -581,7 +581,7 @@ static bool load_rom(const char *path) {
     enum RomType type = rom_type(path);
     if (type == ROM_UNKNOWN) return false;
     if (type == ROM_GB && !enable_gambatte()) {
-        status("Game Boy core missing from .gba folder");
+        status("Game Boy core missing from .boy folder");
         return false;
     }
     initialize_core(type == ROM_GBA ? &gpsp : &gambatte);
@@ -746,7 +746,7 @@ static void draw_ui(void) {
     switch (screen) {
     case GAME: draw_game(); break;
     case BROWSER: {
-        header("QEMU2-pod", rom_count ? "Choose a cartridge" : "Copy .gb, .gbc or .gba files to GBA/ROMs on the SD card");
+        header("q2-boy", rom_count ? "Choose a cartridge" : "Copy .gb, .gbc or .gba files to q2-boy/ROMs on the SD card");
         int start = (selection / ROWS) * ROWS;
         for (int i = 0; i < ROWS && start + i < rom_count; ++i)
             row(i, roms[start + i], start + i == selection);
@@ -1360,7 +1360,7 @@ static void write_fatal(int sig) {
 }
 static void log_launch(void) {
     char log[PATH_CAP], previous[PATH_CAP], flag[PATH_CAP];
-    if (file_path(log, sizeof log, data_dir, "/gba-test.log")) {
+    if (file_path(log, sizeof log, data_dir, "/q2-boy.log")) {
         struct stat st;
         if (!stat(log, &st) && st.st_size > 128 * 1024 &&
             file_path(previous, sizeof previous, log, ".previous"))
@@ -1379,7 +1379,7 @@ static void log_launch(void) {
     sigaction(SIGSEGV, &action, NULL);
     sigaction(SIGABRT, &action, NULL);
     sigaction(SIGFPE, &action, NULL);
-    fprintf(stderr, "\nQEMU2-pod 0.2.1, engine=%s\n",
+    fprintf(stderr, "\nq2-boy 0.2.2, engine=%s\n",
             use_dynarec ? "dynamic recompiler (opt-in)" : "interpreter");
     FILE *memory = fopen("/proc/meminfo", "r");
     if (memory) {
@@ -1392,10 +1392,21 @@ int main(int argc, char **argv) {
     smoke = argc >= 4 && (!strcmp(argv[1], "--smoke") || !strcmp(argv[1], "--smoke-dynarec"));
     use_dynarec = smoke && !strcmp(argv[1], "--smoke-dynarec");
     if (smoke) data_dir = argv[3];
+    else {
+        /* Move existing data only when the new data directory does not exist. */
+        struct stat legacy, current;
+        const char *legacy_dir = "/mnt/mmc/GBA";
+        if (stat(data_dir, &current) && errno == ENOENT &&
+            !stat(legacy_dir, &legacy) && S_ISDIR(legacy.st_mode) &&
+            rename(legacy_dir, data_dir)) {
+            fprintf(stderr, "Could not move existing cartridge data: %s\n", strerror(errno));
+            return 1;
+        }
+    }
     if (!prepare_dirs()) return 1;
     if (!smoke) {
         log_launch();
-        const char *bridge = getenv("Q2_GBA_AUDIO_BRIDGE");
+        const char *bridge = getenv("Q2_BOY_AUDIO_BRIDGE");
         audio_bridge = bridge != NULL;
         native_supported = bridge && *bridge == '2';
         music_mode = audio_bridge && argc == 1;

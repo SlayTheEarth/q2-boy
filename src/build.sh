@@ -4,7 +4,7 @@ set -eu
 : "${GPSP:?Set GPSP to the gpSP directory with built gpsp.a}"
 CC_Q2=${CC_Q2:-clang}
 LD_Q2=${LD_Q2:-ld.lld}
-out=${1:-q2-gba}
+out=${1:-q2-boy}
 src=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
