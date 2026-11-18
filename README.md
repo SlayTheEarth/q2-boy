@@ -12,6 +12,7 @@ All three share the same controls, menus, display options, save slots, and
 The standard Q2-Pod 1.8.8 card-game launcher is sufficient for emulation,
 controls, game audio, save states, and fast-forward. Background Q2 music
 and native Now Playing use the [q2-boy firmware bridge](https://github.com/DiamondBond/q2-pod/pull/426).
+Firmware with that bridge keeps music already playing when q2-boy opens.
 
 ## Install on the Q2
 

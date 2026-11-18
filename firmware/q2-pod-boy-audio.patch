@@ -1,5 +1,5 @@
 diff --git a/patch/addon.c b/patch/addon.c
-index bc4b1f6..d057da8 100644
+index bc4b1f6..5e79197 100644
 --- a/patch/addon.c
 +++ b/patch/addon.c
 @@ -829,12 +829,19 @@ static struct {
@@ -41,7 +41,7 @@ index bc4b1f6..d057da8 100644
 +    if (gm.boy_bridge) {
 +        unlink(BOY_AUDIO_REQUEST);
 +        unlink(BOY_AUDIO_REPLY);
-+        audio = !boy_prefers_music();
++        audio = !media_playing() && !boy_prefers_music();
 +        if (audio) boy_take_audio();
 +    }
 +    if (audio) {
