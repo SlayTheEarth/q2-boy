@@ -36,6 +36,8 @@ saves, and settings you want to keep into the new folder.
 By default, the Q2's Return, Play/Pause, Previous, and Next buttons act as
 Up, Down, Left, and Right during play. Centre acts as A. B, L, R, Start,
 Select, and Menu are visible touchscreen overlays.
+Their backgrounds default to 30% transparency. L and R sit higher and
+farther in from the corners. Menu, Select, and Start sit near the bottom.
 
 - **Menu → Display and controls → Physical buttons** assigns each of the
   five Q2 buttons to a cartridge action. Remaps apply during gameplay. Centre
@@ -46,6 +48,10 @@ Select, and Menu are visible touchscreen overlays.
   and use **Assign action** to remap a gameplay overlay. Menu remains
   available so there's always a way back.
 - **Reset controls** restores the default layout and assignments.
+
+The emulator menu puts the fast-forward toggle beside its speed setting.
+**ROM library** keeps the current cartridge running at normal speed in the
+background. Choose **Resume** to return to it, or select another cartridge.
 
 ## Development
 
