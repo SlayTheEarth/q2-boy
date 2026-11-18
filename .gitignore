@@ -1,0 +1,9 @@
+/deps/
+/dist/
+/build/
+*.o
+*.a
+*.gba
+*.srm
+*.state*
+update.tar
