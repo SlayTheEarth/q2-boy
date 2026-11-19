@@ -1,11 +1,13 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 #include "platform.h"
+#include "cover.h"
 #include "libretro.h"
 #include <dlfcn.h>
 #include "font.h"
 #include <dirent.h>
 #include <errno.h>
 #include <stdarg.h>
+#include <stddef.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -30,7 +32,7 @@
 #define DARK RGB(0x0c161a)
 #define PATH_CAP 700
 
-enum Screen { BROWSER, GAME, MENU, STATES, SETTINGS, EDIT, CONFIRM, AUDIO, PHYSICAL, TOUCH, ASSIGN };
+enum Screen { BROWSER, GAME, MENU, STATES, SETTINGS, EDIT, CONFIRM, AUDIO, PHYSICAL, TOUCH, ASSIGN, BROWSER_OPTIONS };
 enum Scale { FIT, CROP, STRETCH };
 enum Control { L, R, B, MENU_BUTTON, SPEED, QUICK_SAVE, QUICK_LOAD, AB, SELECT_BUTTON, START_BUTTON, TOUCH_A, TOUCH_UP, TOUCH_DOWN, TOUCH_LEFT, TOUCH_RIGHT, CONTROLS };
 enum Action { SAVE = 1, LOAD };
@@ -119,7 +121,7 @@ static double measured_speed;
 static Button buttons[CONTROLS];
 static enum Screen screen = BROWSER, confirm_from;
 static enum Scale scaling;
-static int running, fast, dirty = 1, selection, slot, edit_button, dragging = -1;
+static int running, fast, dirty = 1, slot, edit_button, dragging = -1;
 static int drag_x, drag_y, edit_start_x, edit_start_y, edit_moved, touch_button = -1, wheel_delta, menu_focus;
 
 static enum Action confirm_action;
@@ -129,8 +131,43 @@ static char notice[95];
 static const char *data_dir = "/mnt/mmc/q2-boy";
 static char rom_dir[PATH_CAP], save_dir[PATH_CAP], game_base[PATH_CAP], config_file[PATH_CAP];
 static char active_rom[PATH_CAP];
-static char roms[ROM_LIMIT][256];
-static int rom_count;
+enum RomSort { SORT_TITLE, SORT_RECENT, SORT_COUNT };
+static const char *const sort_labels[] = {"Title (A-Z)", "Last played"};
+static const char *const sort_short[] = {"A-Z", "Recent"};
+static const char *const system_names[] = {"Game Boy", "Game Boy Color", "Game Boy Advance"};
+static const char *const system_short[] = {"GB", "GBC", "GBA"};
+typedef struct {
+    char name[256];
+    int title_length, recent_rank;
+    enum CartridgeSystem system;
+} Rom;
+typedef struct { int first, end, selected; } RomShelf;
+typedef char RomName[sizeof ((Rom *)0)->name];
+static Rom roms[ROM_LIMIT];
+static RomShelf shelves[SYSTEM_COUNT], *shelf = &shelves[SYSTEM_GB], *previous_shelf;
+static int rom_count, recent_count;
+static struct {
+    unsigned char version, sort, list;
+    char recent[ROM_LIMIT][256];
+} library;
+static char library_file[PATH_CAP];
+static float flow_position, flow_start, flow_drag_origin;
+static uint64_t flow_started, flow_draw_at, title_since, system_slide_started;
+static bool touching_flow;
+static enum { TOUCH_TAP, TOUCH_HORIZONTAL, TOUCH_VERTICAL } flow_gesture;
+static int flow_down_x, flow_down_y, system_slide_direction, system_slide_offset;
+
+#define BROWSER_BUTTON_Y 12
+#define EXIT_X 36
+#define EXIT_W 84
+#define SORT_X 235
+#define SORT_W 103
+#define FLOW_FOOT_Y 272
+#define SHELF_TRAVEL 270
+#define SYSTEM_SLIDE_NS 210000000ull
+#define LIST_TOP 58
+#define LIST_ROW 42
+#define SYSTEM_GESTURE_PX 38
 static uint32_t cart[CART_WIDTH * CART_HEIGHT], canvas[WIDTH * HEIGHT], color[65536];
 static bool smoke, have_frame, use_dynarec;
 static volatile sig_atomic_t launch_stage;
@@ -324,15 +361,6 @@ static void header(const char *title, const char *sub) {
     rect(0, 0, WIDTH, HEIGHT, DARK);
     text_at(17, 10, title, ACCENT, WIDTH - 16);
     text_at(17, 31, sub, GRAY, WIDTH - 16);
-}
-static void row(int index, const char *name, bool selected) {
-    int y = 47 + index * 43;
-    rect(13, y, WIDTH - 26, 40, selected ? RGB(0x245448) : RGB(0x16282b));
-    text_at(24, y + 11, name, WHITE, WIDTH - 25);
-}
-static void box(int x, int y, int w, const char *name, bool enabled) {
-    rect(x, y, w, 38, enabled ? RGB(0x245448) : RGB(0x16282b));
-    text_at(x + 8, y + 10, name, enabled ? WHITE : GRAY, x + w - 4);
 }
 static int file_path(char *path, size_t capacity, const char *base, const char *ext) {
     int n = snprintf(path, capacity, "%s%s", base, ext);
@@ -541,6 +569,11 @@ static bool state_io(enum Action action, int number) {
 static void set_screen(enum Screen next) {
     if (!smoke && running && (screen == GAME || next == GAME)) platform_audio_reset();
     screen = next;
+    touching_flow = false;
+    flow_position = shelf->selected;
+    flow_started = 0;
+    previous_shelf = NULL;
+    title_since = clock_ns();
     physical_keys = gameplay_buttons = 0;
     menu_focus = wheel_delta = 0;
     pressed_this_frame = 0;
@@ -581,22 +614,136 @@ static void set_fast(void) {
     dirty = 1;
 }
 static bool emulation_active(void) {
-    return running && (screen == GAME || screen == BROWSER);
+    return running && (screen == GAME || screen == BROWSER || screen == BROWSER_OPTIONS);
 }
-static int rom_compare(const void *a, const void *b) { return strcasecmp(a, b); }
-static void scan_roms(void) {
-    rom_count = 0;
-    DIR *dir = opendir(rom_dir);
-    if (!dir) return;
-    struct dirent *entry;
-    while ((entry = readdir(dir)) && rom_count < ROM_LIMIT) {
-        if (entry->d_name[0] == '.' || rom_type(entry->d_name) == ROM_UNKNOWN) continue;
-        snprintf(roms[rom_count++], sizeof roms[0], "%s", entry->d_name);
+static void load_library(void) {
+    FILE *file = fopen(library_file, "rb");
+    if (!file) return;
+    size_t header_size = offsetof(__typeof__(library), recent);
+    if (fread(&library, 1, header_size, file) != header_size ||
+        library.version != 1 || library.sort > SORT_COUNT || library.list > 1) {
+        memset(&library, 0, sizeof library);
+    } else {
+        /* v0.2.5 stored a separate System sort. Shelves now always group by system. */
+        if (library.sort == SORT_COUNT) library.sort = SORT_TITLE;
+        while (recent_count < ROM_LIMIT &&
+               fread(library.recent[recent_count], sizeof library.recent[0], 1, file) == 1) {
+            char *name = library.recent[recent_count];
+            if (!name[0] || !memchr(name, 0, sizeof library.recent[0])) break;
+            ++recent_count;
+        }
     }
-    closedir(dir);
-    qsort(roms, rom_count, sizeof roms[0], rom_compare);
-    selection = clamp(selection, 0, rom_count ? rom_count - 1 : 0);
+    fclose(file);
 }
+
+static void store_library(void) {
+    library.version = 1;
+    size_t length = offsetof(__typeof__(library), recent) + recent_count * sizeof library.recent[0];
+    if (!file_write(library_file, &library, length)) fprintf(stderr, "Could not save ROM library settings\n");
+}
+
+static int rom_compare(const void *left, const void *right) {
+    const Rom *a = left, *b = right;
+    if (a->system != b->system) return (int)a->system - (int)b->system;
+    if (library.sort == SORT_RECENT && a->recent_rank != b->recent_rank)
+        return a->recent_rank - b->recent_rank;
+    int compare = strncasecmp(a->name, b->name, a->title_length < b->title_length
+                                              ? a->title_length : b->title_length);
+    if (!compare) compare = a->title_length - b->title_length;
+    return compare ? compare : strcmp(a->name, b->name);
+}
+
+static enum CartridgeSystem rom_system(const char *name) {
+    const char *ext = strrchr(name, '.');
+    if (ext && !strcasecmp(ext, ".gba")) return SYSTEM_GBA;
+    if (ext && !strcasecmp(ext, ".gbc")) return SYSTEM_GBC;
+    return SYSTEM_GB;
+}
+
+static bool shelf_has_games(const RomShelf *page) { return page->first < page->end; }
+
+static void remember_highlights(RomName names[SYSTEM_COUNT]) {
+    for (int system = 0; system < SYSTEM_COUNT; ++system) {
+        const RomShelf *page = &shelves[system];
+        names[system][0] = 0;
+        if (shelf_has_games(page)) strcpy(names[system], roms[page->selected].name);
+    }
+}
+
+static void sort_library(RomName names[SYSTEM_COUNT]) {
+    for (int i = 0; i < rom_count; ++i) {
+        int rank = 0;
+        while (rank < recent_count && strcmp(roms[i].name, library.recent[rank])) ++rank;
+        roms[i].recent_rank = rank;
+    }
+    qsort(roms, rom_count, sizeof roms[0], rom_compare);
+    int i = 0;
+    for (int system = 0; system < SYSTEM_COUNT; ++system) {
+        RomShelf *page = &shelves[system];
+        page->first = page->selected = i;
+        while (i < rom_count && (int)roms[i].system == system) {
+            if (!strcmp(roms[i].name, names[system])) page->selected = i;
+            ++i;
+        }
+        page->end = i;
+    }
+    if (!shelf_has_games(shelf)) {
+        shelf = &shelves[SYSTEM_GB];
+        for (int system = 0; system < SYSTEM_COUNT && !shelf_has_games(shelf); ++system) {
+            if (shelf_has_games(&shelves[system])) shelf = &shelves[system];
+        }
+    }
+    flow_position = shelf->selected;
+    flow_started = 0;
+    previous_shelf = NULL;
+    title_since = clock_ns();
+    dirty = 1;
+}
+
+static void scan_roms(void) {
+    RomName selected[SYSTEM_COUNT];
+    remember_highlights(selected);
+    if (!rom_count && recent_count) {
+        enum CartridgeSystem system = rom_system(library.recent[0]);
+        shelf = &shelves[system];
+        strcpy(selected[system], library.recent[0]);
+    }
+    rom_count = 0;
+    cover_clear();
+    DIR *dir = opendir(rom_dir);
+    if (dir) {
+        struct dirent64 *entry;
+        while ((entry = readdir64(dir)) && rom_count < ROM_LIMIT) {
+            if (entry->d_name[0] == '.' || rom_type(entry->d_name) == ROM_UNKNOWN) continue;
+            char path[PATH_CAP];
+            int length = snprintf(path, sizeof path, "%s/%s", rom_dir, entry->d_name);
+            struct stat64 st;
+            if (length < 0 || (size_t)length >= sizeof path || stat64(path, &st) || !S_ISREG(st.st_mode)) continue;
+            Rom *rom = &roms[rom_count++];
+            strcpy(rom->name, entry->d_name);
+            const char *ext = strrchr(rom->name, '.');
+            rom->title_length = (int)(ext - rom->name);
+            rom->system = rom_system(rom->name);
+        }
+        closedir(dir);
+    }
+    sort_library(selected);
+}
+
+static void remember_launch(void) {
+    RomName selected[SYSTEM_COUNT];
+    remember_highlights(selected);
+    int rank = roms[shelf->selected].recent_rank;
+    if (!rank && recent_count) return;
+    int move = clamp(rank, 0, ROM_LIMIT - 1);
+    memmove(library.recent + 1, library.recent, move * sizeof library.recent[0]);
+    memset(library.recent[0], 0, sizeof library.recent[0]);
+    strcpy(library.recent[0], selected[shelf - shelves]);
+    if (rank == recent_count && recent_count < ROM_LIMIT) ++recent_count;
+    sort_library(selected);
+    store_library();
+}
+
 static void close_rom(void);
 static bool load_rom(const char *path) {
     const char *name = strrchr(path, '/');
@@ -664,9 +811,9 @@ static bool load_rom(const char *path) {
 }
 static void launch_selected(void) {
     char path[PATH_CAP];
-    if (!rom_count) return;
+    if (!shelf_has_games(shelf)) return;
     notice_end = 0;
-    if (snprintf(path, sizeof path, "%s/%s", rom_dir, roms[selection]) >= (int)sizeof path) return;
+    if (snprintf(path, sizeof path, "%s/%s", rom_dir, roms[shelf->selected].name) >= (int)sizeof path) return;
     if (running && !strcmp(active_rom, path)) { set_screen(GAME); return; }
 
     char previous[PATH_CAP];
@@ -681,7 +828,9 @@ static void launch_selected(void) {
         }
         strcpy(previous, active_rom);
     }
-    if (!load_rom(path)) {
+    if (load_rom(path)) {
+        remember_launch();
+    } else {
         if (!running && snapshot && load_rom(previous)) {
             bool restored = core->unserialize(snapshot, length);
             slot = previous_slot;
@@ -718,6 +867,14 @@ static int menu_items(MenuItem *items) {
     snprintf(m->label, sizeof m->label, "%s", (label_)); \
 } while (0)
     switch (screen) {
+    case BROWSER_OPTIONS:
+        for (int i = 0; i < SORT_COUNT; ++i) {
+            snprintf(label, sizeof label, "%s%s", sort_labels[i], library.sort == i ? "  (current)" : "");
+            ITEM(35, 52 + i * 43, 305, 39, label, true);
+        }
+        ITEM(35, 138, 305, 39, library.list ? "Cover Flow" : "List view", true);
+        ITEM(35, 181, 305, 39, "Refresh ROMs and covers", true);
+        break;
     case MENU:
         ITEM(15, 50, 170, 41, "Resume", true);
         ITEM(190, 50, 170, 41, "Q2 Now Playing", native_supported && !pending_action);
@@ -800,21 +957,176 @@ static int menu_items(MenuItem *items) {
 #undef ITEM
     return count;
 }
+#define CAPTION_EDGE 36
+#define MARQUEE_WAIT_MS 950
+#define MARQUEE_SPEED 32
+#define FLOW_NS 170000000ull
+#define BROWSER_FRAME_NS 33333333ull
+#define SHELF_INK RGB(0x000000)
+
+static int glyph_index(unsigned char ch) {
+    return ch < 32 || ch > 126 ? '?' - 32 : ch - 32;
+}
+
+static int text_width(const char *text, const unsigned char *widths) {
+    int width = 0;
+    for (; *text; ++text) width += widths[glyph_index((unsigned char)*text)];
+    return width;
+}
+
+static void caption(int y, const char *label, uint32_t ink, int size, uint64_t now) {
+    bool title = size == 24;
+    const unsigned char *widths = title ? advance_24 : advance_20;
+    int w = text_width(label, widths), h = title ? 28 : 24;
+    int x = (WIDTH - w) / 2;
+    int max_width = WIDTH - CAPTION_EDGE * 2;
+    if (w > max_width) {
+        uint64_t ms = now > title_since ? (now - title_since) / 1000000 : 0;
+        unsigned overflow = w - max_width;
+        unsigned sweep_ms = overflow * 1000 / MARQUEE_SPEED;
+        unsigned at = ms % (2 * (sweep_ms + MARQUEE_WAIT_MS));
+        if (at > sweep_ms + MARQUEE_WAIT_MS) at = 2 * (sweep_ms + MARQUEE_WAIT_MS) - at;
+        x = CAPTION_EDGE - (int)(at > MARQUEE_WAIT_MS ? (at - MARQUEE_WAIT_MS) * MARQUEE_SPEED / 1000 : 0);
+    }
+    for (; *label && x < WIDTH - CAPTION_EDGE; ++label) {
+        int glyph = glyph_index((unsigned char)*label);
+        const uint32_t *rows = title ? glyphs_24[glyph] : glyphs_20[glyph];
+        for (int row = 0; row < h; ++row) {
+            for (int col = 0; col < 26; ++col) {
+                int pixel = x + col;
+                if (pixel >= CAPTION_EDGE && pixel < WIDTH - CAPTION_EDGE &&
+                    (unsigned)(y + row) < HEIGHT && (rows[row] >> col & 1u))
+                    canvas[(y + row) * WIDTH + pixel] = ink;
+            }
+        }
+        x += widths[glyph];
+    }
+}
+
+static void selected_title(int index, char title[256]) {
+    const Rom *rom = &roms[index];
+    memcpy(title, rom->name, rom->title_length);
+    title[rom->title_length] = 0;
+}
+
+static void draw_shelf(const RomShelf *page, float position, int offset_y, uint64_t now) {
+    int mid = (int)(position + 0.5f);
+    int left = clamp(mid - 4, page->first, page->end - 1);
+    int right = clamp(mid + 4, page->first, page->end - 1);
+    /* Paint farther cards first so the active cover overlaps its neighbors. */
+    while (left <= right) {
+        int i = position - left > right - position ? left++ : right--;
+        cover_draw(canvas, rom_dir, roms[i].name, roms[i].system, i - position, offset_y);
+    }
+    char title[256], sub[64];
+    selected_title(mid, title);
+    snprintf(sub, sizeof sub, "%s | %d of %d", system_names[page - shelves],
+             mid - page->first + 1, page->end - page->first);
+    caption(254 + offset_y, title, RGB(0xffffff), 24, now);
+    caption(282 + offset_y, sub, RGB(0xaaaaaa), 20, now);
+}
+
+static void browser_button(int x, int y, int width, const char *label, bool enabled) {
+    rect(x, y, width, 38, enabled ? RGB(0x242424) : RGB(0x141414));
+    text_at(x + (width - text_width(label, advance)) / 2, y + 10, label,
+            enabled ? WHITE : RGB(0x777777), x + width - 4);
+}
+
+static int list_first(void) {
+    return shelf->first + ((shelf->selected - shelf->first) / ROWS) * ROWS;
+}
+
+static void draw_system_indicator(void) {
+    int count = 0;
+    for (int system = 0; system < SYSTEM_COUNT; ++system)
+        if (shelf_has_games(&shelves[system])) ++count;
+    if (count < 2) return;
+    int y = HEIGHT / 2 - (count - 1) * 12;
+    const int x = WIDTH - 16;
+    for (int system = 0; system < SYSTEM_COUNT; ++system) {
+        if (!shelf_has_games(&shelves[system])) continue;
+        bool active = shelf == &shelves[system];
+        int half = active ? 7 : 3;
+        rect(x - 4, y - half - 1, 8, 2 * half + 2, RGB(0x101010));
+        rect(x - 2, y - half + 2, 4, 2 * half - 4, active ? WHITE : RGB(0x888888));
+        rect(x - 1, y - half + 1, 2, 2 * half - 2, active ? WHITE : RGB(0x888888));
+        y += 24;
+    }
+}
+
+static void draw_browser(void) {
+    rect(0, 0, WIDTH, HEIGHT, SHELF_INK);
+    if (!shelf_has_games(shelf)) {
+        caption(111, "No games found", WHITE, 24, 0);
+        const char *hint = "Copy ROMs to q2-boy/ROMs.";
+        text_at((WIDTH - text_width(hint, advance)) / 2, 154, hint, GRAY, WIDTH);
+    } else if (library.list) {
+        int start = list_first();
+        for (int i = start; i < shelf->end && i < start + ROWS; ++i) {
+            int y = LIST_TOP + (i - start) * LIST_ROW;
+            rect(28, y, WIDTH - 56, 39, i == shelf->selected ? RGB(0x393939) : RGB(0x181818));
+            char title[256];
+            selected_title(i, title);
+            text_at(40, y + 11, title, WHITE, WIDTH - 40);
+        }
+        browser_button(37, FLOW_FOOT_Y, 89, "Previous", start > shelf->first);
+        browser_button(133, FLOW_FOOT_Y, 89, "Next", start + ROWS < shelf->end);
+        text_at(232, FLOW_FOOT_Y + 10, system_short[shelf - shelves], GRAY, WIDTH - 30);
+    } else {
+        uint64_t now = clock_ns();
+        int offset = previous_shelf ? system_slide_offset : 0;
+        if (previous_shelf)
+            draw_shelf(previous_shelf, previous_shelf->selected,
+                       offset - system_slide_direction * SHELF_TRAVEL, 0);
+        draw_shelf(shelf, flow_position, offset, now);
+    }
+    rect(0, 0, WIDTH, BROWSER_BUTTON_Y + 38, SHELF_INK);
+    draw_system_indicator();
+    char sort[26];
+    snprintf(sort, sizeof sort, "Sort: %s", sort_short[library.sort]);
+    browser_button(SORT_X, BROWSER_BUTTON_Y, SORT_W, sort, true);
+    browser_button(EXIT_X, BROWSER_BUTTON_Y, EXIT_W, running ? "Resume" : "Exit", true);
+}
+
+static void update_browser(uint64_t now) {
+    if (screen != BROWSER || library.list || !shelf_has_games(shelf) || now < flow_draw_at) return;
+    flow_draw_at = now + BROWSER_FRAME_NS;
+    if (previous_shelf) {
+        uint64_t elapsed = now >= system_slide_started ? now - system_slide_started : 0;
+        if (elapsed >= SYSTEM_SLIDE_NS) {
+            previous_shelf = NULL;
+            system_slide_offset = 0;
+        } else {
+            float remaining = 1.0f - (float)elapsed / SYSTEM_SLIDE_NS;
+            system_slide_offset = system_slide_direction * SHELF_TRAVEL * remaining * remaining * remaining;
+        }
+        dirty = 1;
+    }
+    if (flow_started) {
+        uint64_t elapsed = now >= flow_started ? now - flow_started : 0;
+        if (elapsed >= FLOW_NS) {
+            flow_position = shelf->selected;
+            flow_started = 0;
+        } else {
+            float remaining = 1.0f - (float)elapsed / FLOW_NS;
+            flow_position = shelf->selected + (flow_start - shelf->selected) * remaining * remaining * remaining;
+        }
+        dirty = 1;
+    } else {
+        char title[256];
+        selected_title(shelf->selected, title);
+        if (text_width(title, advance_24) > WIDTH - CAPTION_EDGE * 2) dirty = 1;
+    }
+}
+
 static void draw_ui(void) {
     char label[256], sub[128];
     switch (screen) {
     case GAME: draw_game(); break;
-    case BROWSER: {
-        header("q2-boy", rom_count ? "Choose a cartridge" : "Copy .gb, .gbc or .gba files to q2-boy/ROMs on the SD card");
-        int start = (selection / ROWS) * ROWS;
-        for (int i = 0; i < ROWS && start + i < rom_count; ++i)
-            row(i, roms[start + i], start + i == selection);
-        box(14, 270, 75, "Previous", start > 0);
-        box(97, 270, 75, "Next", start + ROWS < rom_count);
-        box(178, 270, 75, "Refresh", true);
-        box(273, 270, 88, running ? "Resume" : "Exit", true);
+    case BROWSER: draw_browser(); break;
+    case BROWSER_OPTIONS:
+        header("Library options", "Use the wheel and Centre, or tap an option.");
         break;
-    }
     case MENU:
         header("Emulator Menu", "Scroll to highlight. Press Centre to select.");
         break;
@@ -878,7 +1190,7 @@ static void draw_ui(void) {
         rect(37, HEIGHT - 29, WIDTH - 74, 23, DARK);
         text_at(45, HEIGHT - 26, notice, ACCENT, WIDTH - 42);
     }
-    if (!smoke) platform_present(canvas, paced_video());
+    if (!smoke) platform_present(canvas, paced_video() || screen == BROWSER || screen == BROWSER_OPTIONS);
     dirty = 0;
 }
 
@@ -895,6 +1207,7 @@ static bool within(int x, int y, int left, int top, int width) {
 }
 static void go_back(void) {
     switch (screen) {
+    case BROWSER_OPTIONS: set_screen(BROWSER); break;
     case BROWSER:
         if (running) set_screen(GAME);
         else quitting = 1;
@@ -910,15 +1223,56 @@ static void go_back(void) {
 }
 static void slot_step(int step) { slot = (slot + step + SLOTS) % SLOTS; dirty = 1; }
 static void pick_rom(int step) {
-    if (rom_count) selection = clamp(selection + step, 0, rom_count - 1);
+    if (!shelf_has_games(shelf)) return;
+    shelf->selected = clamp(shelf->selected + step, shelf->first, shelf->end - 1);
+    if (library.list) flow_position = shelf->selected;
+    else {
+        if (flow_position < shelf->selected - 2) flow_position = shelf->selected - 2;
+        if (flow_position > shelf->selected + 2) flow_position = shelf->selected + 2;
+        flow_start = flow_position;
+        flow_started = flow_start != shelf->selected ? clock_ns() : 0;
+        flow_draw_at = 0;
+    }
+    title_since = clock_ns();
     dirty = 1;
 }
+
+static void pick_system(int direction) {
+    for (int system = (int)(shelf - shelves) + direction;
+         system >= 0 && system < SYSTEM_COUNT; system += direction) {
+        if (!shelf_has_games(&shelves[system])) continue;
+        previous_shelf = library.list ? NULL : shelf;
+        shelf = &shelves[system];
+        flow_position = shelf->selected;
+        flow_started = flow_draw_at = 0;
+        wheel_delta = 0;
+        title_since = system_slide_started = clock_ns();
+        system_slide_direction = direction;
+        system_slide_offset = direction * SHELF_TRAVEL;
+        dirty = 1;
+        break;
+    }
+}
+
 static void activate_menu(int index) {
     MenuItem items[9];
     int count = menu_items(items);
     if (index < 0 || index >= count || !items[index].enabled) return;
     menu_focus = index;
     switch (screen) {
+    case BROWSER_OPTIONS:
+        if (index < SORT_COUNT) {
+            RomName selected[SYSTEM_COUNT];
+            remember_highlights(selected);
+            library.sort = index;
+            sort_library(selected);
+            store_library();
+        } else if (index == SORT_COUNT) {
+            library.list = !library.list;
+            store_library();
+        } else scan_roms();
+        set_screen(BROWSER);
+        break;
     case MENU:
         switch (index) {
         case 0: set_screen(GAME); break;
@@ -1027,7 +1381,80 @@ static void step_menu(int step) {
     do { menu_focus = (menu_focus + step + count) % count; } while (!items[menu_focus].enabled);
     dirty = 1;
 }
+static void tap_cover(int x, int y) {
+    int mid = (int)(flow_position + 0.5f);
+    int closest = -1;
+    float best = COVER_REACH;
+    for (int i = clamp(mid - 4, shelf->first, shelf->end - 1);
+         i < shelf->end && i <= mid + 4; ++i) {
+        float offset = i - flow_position;
+        float distance = offset < 0 ? -offset : offset;
+        if (distance < best && cover_hit(rom_dir, roms[i].name, roms[i].system, offset, x, y)) {
+            closest = i;
+            best = distance;
+        }
+    }
+    if (closest == mid) {
+        shelf->selected = mid;
+        launch_selected();
+    } else if (closest >= 0) pick_rom(closest - shelf->selected);
+}
+
+static void browser_touch(char action, int x, int y) {
+    if (action == 'd') {
+        touching_flow = true;
+        flow_down_x = x;
+        flow_down_y = y;
+        flow_drag_origin = flow_position;
+        flow_gesture = TOUCH_TAP;
+        return;
+    }
+    if (!touching_flow) return;
+    int dx = x - flow_down_x, dy = y - flow_down_y;
+    if (flow_gesture == TOUCH_TAP && flow_down_y >= BROWSER_BUTTON_Y + 38 &&
+        shelf_has_games(shelf) && (abs(dx) >= 8 || abs(dy) >= 8)) {
+        if (abs(dy) > abs(dx)) flow_gesture = TOUCH_VERTICAL;
+        else if (!library.list) flow_gesture = TOUCH_HORIZONTAL;
+    }
+    if (flow_gesture == TOUCH_HORIZONTAL) {
+        previous_shelf = NULL;
+        flow_started = 0;
+        flow_position = flow_drag_origin - (float)dx / COVER_DRAG_PIXELS;
+        if (flow_position < shelf->first) flow_position = shelf->first;
+        if (flow_position > shelf->end - 1) flow_position = shelf->end - 1;
+        int index = (int)(flow_position + 0.5f);
+        if (index != shelf->selected) title_since = clock_ns();
+        shelf->selected = index;
+        dirty = 1;
+    }
+    if (action != 'u') return;
+    touching_flow = false;
+    if (flow_gesture == TOUCH_HORIZONTAL) { pick_rom(0); return; }
+    if (flow_gesture == TOUCH_VERTICAL) {
+        if (abs(dy) >= SYSTEM_GESTURE_PX) pick_system(dy < 0 ? 1 : -1);
+        return;
+    }
+    if (abs(dx) > 15 || abs(dy) > 15) return;
+    if (within(x, y, SORT_X, BROWSER_BUTTON_Y, SORT_W)) {
+        set_screen(BROWSER_OPTIONS);
+        menu_focus = library.sort;
+    } else if (within(x, y, EXIT_X, BROWSER_BUTTON_Y, EXIT_W)) go_back();
+    else if (!shelf_has_games(shelf) || previous_shelf) return;
+    else if (!library.list && y >= BROWSER_BUTTON_Y + 38) tap_cover(x, y);
+    else if (library.list) {
+        int row = (y - LIST_TOP) / LIST_ROW;
+        int index = list_first() + row;
+        if (x >= 28 && x < WIDTH - 28 && y >= LIST_TOP && row < ROWS &&
+            (y - LIST_TOP) % LIST_ROW < 39 && index < shelf->end) {
+            shelf->selected = index;
+            launch_selected();
+        } else if (within(x, y, 37, FLOW_FOOT_Y, 89)) pick_rom(-ROWS);
+        else if (within(x, y, 133, FLOW_FOOT_Y, 89)) pick_rom(ROWS);
+    }
+}
+
 static void read_touch(char action, int x, int y) {
+    if (screen == BROWSER) { browser_touch(action, x, y); return; }
     if (screen == EDIT && (action == 'm' || action == 'u')) {
         if (abs(x - edit_start_x) + abs(y - edit_start_y) >= 5) edit_moved = 1;
         if (action == 'm' && dragging >= 0 && edit_moved) {
@@ -1042,8 +1469,6 @@ static void read_touch(char action, int x, int y) {
     }
     if (action == 'u') { touch_keys = 0; touch_button = -1; dirty = 1; }
     if (action != 'd') return;
-    int item = y >= 47 && y < 47 + ROWS * 43 && (y - 47) % 43 < 40 ? (y - 47) / 43 : -1;
-    if (x < 13 || x >= WIDTH - 13) item = -1;
     switch (screen) {
     case GAME: {
         int which = hit(x, y);
@@ -1059,16 +1484,9 @@ static void read_touch(char action, int x, int y) {
         if (which == QUICK_LOAD) ask_state(LOAD);
         break;
     }
-    case BROWSER: {
-        int idx = (selection / ROWS) * ROWS + item;
-        if (item >= 0 && idx < rom_count) { selection = idx; launch_selected(); }
-        else if (within(x, y, 14, 270, 75)) pick_rom(-ROWS);
-        else if (within(x, y, 97, 270, 75)) pick_rom(ROWS);
-        else if (within(x, y, 178, 270, 75)) scan_roms();
-        else if (within(x, y, 273, 270, 88)) go_back();
-        break;
-    }
-    case MENU: case STATES: case SETTINGS: case CONFIRM: case AUDIO: case PHYSICAL: case TOUCH: case ASSIGN:
+    case BROWSER: break; /* Handled above to distinguish taps from swipes. */
+    case MENU: case STATES: case SETTINGS: case CONFIRM: case AUDIO: case PHYSICAL: case TOUCH:
+    case ASSIGN: case BROWSER_OPTIONS:
         tap_menu(x, y);
         break;
     case EDIT: {
@@ -1092,9 +1510,10 @@ static void read_wheel(int delta) {
     if (!wheel_time || now - wheel_time > 300000000ull) wheel_delta = 0;
     wheel_time = now;
     wheel_delta += clamp(delta, -84, 84);
-    while (abs(wheel_delta) >= 21) {
+    int tick = screen == BROWSER && !library.list ? 38 : 21;
+    while (abs(wheel_delta) >= tick) {
         int step = wheel_delta < 0 ? 1 : -1;
-        wheel_delta += step * 21;
+        wheel_delta += step * tick;
         if (screen == BROWSER) pick_rom(step);
         else step_menu(step);
     }
@@ -1140,10 +1559,10 @@ static void read_event(Event e) {
             if (screen == BROWSER) launch_selected();
             else activate_menu(menu_focus);
         } else if (screen == BROWSER) {
-            if (id == P_RETURN) pick_rom(-1);
+            if (id == P_RETURN) go_back();
             if (id == P_PLAY) pick_rom(1);
-            if (id == P_PREVIOUS) pick_rom(-ROWS);
-            if (id == P_NEXT) pick_rom(ROWS);
+            if (id == P_PREVIOUS) pick_rom(library.list ? -ROWS : -1);
+            if (id == P_NEXT) pick_rom(library.list ? ROWS : 1);
         } else if (id == P_RETURN) go_back();
     } else {
         held_buttons &= ~bit;
@@ -1250,7 +1669,8 @@ static void initialize_core(const struct Core *selected) {
 static bool prepare_dirs(void) {
     if (!file_path(rom_dir, sizeof rom_dir, data_dir, "/ROMs") ||
         !file_path(save_dir, sizeof save_dir, data_dir, "/Saves") ||
-        !file_path(config_file, sizeof config_file, data_dir, "/controls.cfg")) return false;
+        !file_path(config_file, sizeof config_file, data_dir, "/controls.cfg") ||
+        !file_path(library_file, sizeof library_file, data_dir, "/library.cfg")) return false;
     const char *dirs[] = {data_dir, rom_dir, save_dir};
     for (unsigned i = 0; i < sizeof dirs / sizeof dirs[0]; ++i) {
         struct stat st;
@@ -1383,7 +1803,8 @@ static int smoke_test(const char *path) {
     unsigned frames_before = video_frames;
     core->run();
     if (video_frames != frames_before) { close_rom(); return 28; }
-    read_touch('d', 300, 288);
+    read_touch('d', EXIT_X + 25, BROWSER_BUTTON_Y + 13);
+    read_touch('u', EXIT_X + 25, BROWSER_BUTTON_Y + 13);
     if (quitting || screen != GAME || !running || core != previous_core ||
         slot != 3) { close_rom(); return 29; }
     set_screen(GAME);
@@ -1456,7 +1877,7 @@ static void log_launch(void) {
     sigaction(SIGSEGV, &action, NULL);
     sigaction(SIGABRT, &action, NULL);
     sigaction(SIGFPE, &action, NULL);
-    fprintf(stderr, "\nq2-boy 0.2.4, engine=%s\n",
+    fprintf(stderr, "\nq2-boy 0.2.6, engine=%s\n",
             use_dynarec ? "dynamic recompiler (opt-in)" : "interpreter");
     FILE *memory = fopen("/proc/meminfo", "r");
     if (memory) {
@@ -1506,6 +1927,7 @@ int main(int argc, char **argv) {
         return result;
     }
     if (!raw_buttons && !native_supported) status("Limited input: holding Up may exit");
+    load_library();
     scan_roms();
     uint64_t next_frame = 0;
     while (!quitting) {
@@ -1542,6 +1964,7 @@ int main(int argc, char **argv) {
             cartridge_saves(true);
             next_save = now + 20000000000ull;
         }
+        update_browser(now);
         if (dirty && !native_yielded) draw_ui();
         if (!advance || clock_ns() < next_frame) usleep(1000);
     }

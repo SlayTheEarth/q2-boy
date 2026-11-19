@@ -31,6 +31,32 @@ On first launch q2-boy moves the previous data folder into `q2-boy` if
 that folder does not exist. If both data folders exist, copy any ROMs,
 saves, and settings you want to keep into the new folder.
 
+## ROM library and artwork
+
+Pocket Boy opens in **Cover Flow**. Swipe up to advance through the Game Boy,
+Game Boy Color, and Game Boy Advance shelves, or swipe down to go back. Empty
+systems are skipped. A marker on the right shows which shelf is open. Pocket
+Boy opens on the last played system, or the first available system on a fresh
+install, starting with Game Boy.
+
+Turn the wheel, swipe horizontally, or use Previous and Next to browse games
+within a shelf. Tap a side cover to select it. Press Centre or tap the center
+cover to launch it. **Exit** is in the top left and becomes **Resume** while a
+game is running.
+
+Add a `.png`, `.jpg`, or `.jpeg` beside the ROM using the same base name,
+including spaces and punctuation. For example, place
+`Pokemon - Emerald Version.jpg` beside `Pokemon - Emerald Version.gba` in
+`q2-boy/ROMs`. If several matching images are present, Pocket Boy tries PNG
+first, then JPG and JPEG. PNG supports up to 1024 pixels per side and JPEG
+up to 2048, with an 8 MiB file limit. Covers keep their proportions. Games
+without readable artwork get a cartridge icon.
+
+Open **Sort** to choose **Title (A–Z)** or **Last played** within each system.
+Last played tracks successful launches and lists unplayed games alphabetically
+at the end. The same menu offers **List view** and **Refresh ROMs and covers**.
+Pocket Boy remembers the sort and view on the SD card.
+
 ## Controls
 
 By default, the Q2's Return, Play/Pause, Previous, and Next buttons act as

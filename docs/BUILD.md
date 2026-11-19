@@ -9,6 +9,9 @@ headers match the runtime used for testing. The sysroot layout follows
 For the Debian headers, copy `gnu/stubs-o32_hard.h` to
 `gnu/stubs-o32_hard_2008.h` under the MIPS multiarch include directory.
 Use the Q2 firmware's libraries when linking.
+The Cover Flow browser loads the firmware's `libpng12.so.0` and
+`libjpeg.so.7` at runtime. The JPEG v7-compatible headers in `src/jpeg7`
+come from libjpeg-turbo 2.1.5.1. See their included license files.
 For Gambatte, extract the Debian MIPS little-endian `libstdc++-10-dev`
 package to a separate directory and set `CXX_HEADERS` to that directory.
 Place the firmware's `libstdc++.so.6` in `$SYSROOT/lib`.
