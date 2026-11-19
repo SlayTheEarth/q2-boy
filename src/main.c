@@ -6,6 +6,7 @@
 #include "font.h"
 #include <dirent.h>
 #include <errno.h>
+#include <math.h>
 #include <stdarg.h>
 #include <stddef.h>
 #include <stdbool.h>
@@ -42,6 +43,7 @@ typedef struct { int x, y, size, opacity, visible; unsigned keys; const char *la
 
 #define EDGE_INSET 12
 #define VERTICAL_INSET 5
+#define TOUCH_HIT_PADDING 12
 #define DEFAULT_OPACITY 70
 static const Button defaults[CONTROLS] = {
     {29, 5, 72, DEFAULT_OPACITY, 1, KEY(L), "L"},
@@ -285,11 +287,15 @@ static void move_button(int which, int x, int y) {
     b->x = clamp(x, EDGE_INSET, WIDTH - EDGE_INSET - b->size);
     b->y = clamp(y, VERTICAL_INSET, HEIGHT - VERTICAL_INSET - button_height(which, b));
 }
-static bool inside_shape(int x, int y, int w, int h, int radius) {
-    if (x < 0 || y < 0 || x >= w || y >= h) return false;
+/* Outside the rounded rectangle's inner box, measure from its nearest point. */
+static int shape_distance_squared(int x, int y, int w, int h, int radius) {
     int dx = x < radius ? radius - 1 - x : x >= w - radius ? x - (w - radius) : 0;
     int dy = y < radius ? radius - 1 - y : y >= h - radius ? y - (h - radius) : 0;
-    return dx * dx + dy * dy < radius * radius;
+    return dx * dx + dy * dy;
+}
+static bool inside_shape(int x, int y, int w, int h, int radius) {
+    if (x < 0 || y < 0 || x >= w || y >= h) return false;
+    return shape_distance_squared(x, y, w, h, radius) < radius * radius;
 }
 static void status(const char *message) {
     snprintf(notice, sizeof notice, "%s", message);
@@ -1369,12 +1375,26 @@ static void draw_ui(void) {
 }
 
 static int hit(int x, int y) {
+    if (x < 0 || y < 0 || x >= WIDTH || y >= HEIGHT) return -1;
+    int nearest = -1;
+    float best = TOUCH_HIT_PADDING;
     for (int i = CONTROLS - 1; i >= 0; --i) {
+        if (!overlay_visible(i)) continue;
         const Button *b = &buttons[i];
-        if (overlay_visible(i) && inside_shape(x - b->x, y - b->y, b->size,
-                                       button_height(i, b), button_radius(i, b))) return i;
+        int local_x = x - b->x, local_y = y - b->y;
+        int height = button_height(i, b), radius = button_radius(i, b);
+        int distance_squared = shape_distance_squared(local_x, local_y, b->size, height, radius);
+        if (distance_squared < radius * radius) return i;
+        int reach = radius + TOUCH_HIT_PADDING;
+        if (screen == GAME && distance_squared < reach * reach) {
+            float gap = sqrtf((float)distance_squared) - radius;
+            if (gap < best) {
+                best = gap;
+                nearest = i;
+            }
+        }
     }
-    return -1;
+    return nearest;
 }
 static bool within(int x, int y, int left, int top, int width) {
     return x >= left && x < left + width && y >= top && y < top + 38;
@@ -1917,6 +1937,29 @@ static int smoke_test(const char *path) {
     }
     scaling = initial_scale;
     video_filter = initial_filter;
+    const Button *menu = &buttons[MENU_BUTTON];
+    int menu_x = menu->x + menu->size / 2, menu_y = menu->y - TOUCH_HIT_PADDING;
+    Button saved_b = buttons[B];
+    int menu_right = menu->x + menu->size;
+    int menu_center_y = menu->y + button_height(MENU_BUTTON, menu) / 2;
+    buttons[B].x = menu_right + TOUCH_HIT_PADDING;
+    buttons[B].y = menu_center_y - buttons[B].size / 2;
+    if (hit(menu_right + 2, menu_center_y) != MENU_BUTTON ||
+        hit(menu_right + 10, menu_center_y) != B) { close_rom(); return 34; }
+    buttons[B].x = menu_right + 6;
+    if (hit(menu_right + 7, menu_center_y) != B) { close_rom(); return 35; }
+    buttons[B] = saved_b;
+    int b_x = b->x - 6, b_y = b->y + b->size / 2;
+    read_touch('d', b_x, b_y);
+    if (touch_keys != KEY(B)) { close_rom(); return 36; }
+    read_touch('u', b_x, b_y);
+    pressed_this_frame = 0;
+    read_touch('d', menu_x, menu_y - 1);
+    if (screen != GAME) { close_rom(); return 32; }
+    read_touch('u', menu_x, menu_y - 1);
+    read_touch('d', menu_x, menu_y);
+    if (screen != MENU) { close_rom(); return 33; }
+    read_touch('u', menu_x, menu_y);
     set_screen(MENU);
     read_wheel(-21);
     read_event((Event){'g', 'd', 116, 0});
