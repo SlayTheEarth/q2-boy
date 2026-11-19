@@ -49,11 +49,12 @@ remain, Pocket Boy can still read them from the flat folders.
 
 ## ROM library and artwork
 
-Pocket Boy opens in **Cover Flow**. Swipe up to advance through the Game Boy,
-Game Boy Color, Game Boy Advance, NES, and SNES shelves. Swipe down to go
-back. Empty systems are skipped. A marker on the right shows which shelf is open. Pocket
-Boy opens on the last played system, or the first available system on a fresh
-install, starting with Game Boy.
+Pocket Boy opens in **Cover Flow**. Press **Return** or swipe up to go to the
+previous system. Press **Play/Pause** or swipe down to go to the next system.
+The order is Game Boy, Game Boy Color, Game Boy Advance, NES, and SNES.
+Navigation wraps at both ends and skips empty systems. A marker on the
+right shows the current shelf. Pocket Boy opens on the last played system,
+or the first available system on a fresh install, starting with Game Boy.
 
 Turn the wheel, swipe horizontally, or use Previous and Next to browse games
 within a shelf. Tap a side cover to select it. Press Centre or tap the center

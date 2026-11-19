@@ -1320,8 +1320,9 @@ static void pick_rom(int step) {
 }
 
 static void pick_system(int direction) {
-    for (int system = (int)(shelf - shelves) + direction;
-         system >= 0 && system < SYSTEM_COUNT; system += direction) {
+    int current = (int)(shelf - shelves);
+    for (int step = 1; step < SYSTEM_COUNT; ++step) {
+        int system = (current + step * direction + SYSTEM_COUNT) % SYSTEM_COUNT;
         if (!shelf_has_games(&shelves[system])) continue;
         previous_shelf = library.list ? NULL : shelf;
         shelf = &shelves[system];
@@ -1515,7 +1516,7 @@ static void browser_touch(char action, int x, int y) {
     touching_flow = false;
     if (flow_gesture == TOUCH_HORIZONTAL) { pick_rom(0); return; }
     if (flow_gesture == TOUCH_VERTICAL) {
-        if (abs(dy) >= SYSTEM_GESTURE_PX) pick_system(dy < 0 ? 1 : -1);
+        if (abs(dy) >= SYSTEM_GESTURE_PX) pick_system(dy > 0 ? 1 : -1);
         return;
     }
     if (abs(dx) > 15 || abs(dy) > 15) return;
@@ -1649,10 +1650,12 @@ static void read_event(Event e) {
             if (screen == BROWSER) launch_selected();
             else activate_menu(menu_focus);
         } else if (screen == BROWSER) {
-            if (id == P_RETURN) go_back();
-            if (id == P_PLAY) pick_rom(1);
-            if (id == P_PREVIOUS) pick_rom(library.list ? -ROWS : -1);
-            if (id == P_NEXT) pick_rom(library.list ? ROWS : 1);
+            if (!library.list && (id == P_RETURN || id == P_PLAY))
+                pick_system(id == P_PLAY ? 1 : -1);
+            else if (id == P_RETURN) go_back();
+            else if (id == P_PLAY) pick_rom(1);
+            else if (id == P_PREVIOUS) pick_rom(library.list ? -ROWS : -1);
+            else if (id == P_NEXT) pick_rom(library.list ? ROWS : 1);
         } else if (id == P_RETURN) go_back();
     } else {
         held_buttons &= ~bit;
@@ -1962,7 +1965,7 @@ static void log_launch(void) {
     sigaction(SIGSEGV, &action, NULL);
     sigaction(SIGABRT, &action, NULL);
     sigaction(SIGFPE, &action, NULL);
-    fprintf(stderr, "\nq2-boy 0.3.1, engine=%s\n",
+    fprintf(stderr, "\nq2-boy 0.3.2, engine=%s\n",
             use_dynarec ? "dynamic recompiler (opt-in)" : "interpreter");
     FILE *memory = fopen("/proc/meminfo", "r");
     if (memory) {
