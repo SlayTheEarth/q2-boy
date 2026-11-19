@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 #include "platform.h"
-#include "cover.h"
+#include "library_paths.h"
 #include "libretro.h"
 #include <dlfcn.h>
 #include "font.h"
@@ -19,8 +19,10 @@
 #include <time.h>
 #include <unistd.h>
 
-#define CART_WIDTH 240
-#define CART_HEIGHT 160
+#define GBA_WIDTH 240
+#define GBA_HEIGHT 160
+#define CART_WIDTH 512
+#define CART_HEIGHT 512
 #define SLOTS 10
 #define ROWS 5
 #define ROM_LIMIT 200
@@ -30,11 +32,10 @@
 #define WHITE RGB(0xf7faf9)
 #define GRAY RGB(0xa6b9bb)
 #define DARK RGB(0x0c161a)
-#define PATH_CAP 700
 
 enum Screen { BROWSER, GAME, MENU, STATES, SETTINGS, EDIT, CONFIRM, AUDIO, PHYSICAL, TOUCH, ASSIGN, BROWSER_OPTIONS };
 enum Scale { FIT, CROP, STRETCH };
-enum Control { L, R, B, MENU_BUTTON, SPEED, QUICK_SAVE, QUICK_LOAD, AB, SELECT_BUTTON, START_BUTTON, TOUCH_A, TOUCH_UP, TOUCH_DOWN, TOUCH_LEFT, TOUCH_RIGHT, CONTROLS };
+enum Control { L, R, B, MENU_BUTTON, SPEED, QUICK_SAVE, QUICK_LOAD, AB, SELECT_BUTTON, START_BUTTON, TOUCH_A, TOUCH_UP, TOUCH_DOWN, TOUCH_LEFT, TOUCH_RIGHT, TOUCH_X, TOUCH_Y, CONTROLS };
 enum Action { SAVE = 1, LOAD };
 typedef struct { int x, y, size, opacity, visible; unsigned keys; const char *label; } Button;
 
@@ -56,7 +57,9 @@ static const Button defaults[CONTROLS] = {
     {64, 127, 42, DEFAULT_OPACITY, 0, KEY(UP), "Up"},
     {64, 215, 42, DEFAULT_OPACITY, 0, KEY(DOWN), "Down"},
     {20, 171, 42, DEFAULT_OPACITY, 0, KEY(LEFT), "Left"},
-    {108, 171, 42, DEFAULT_OPACITY, 0, KEY(RIGHT), "Right"}
+    {108, 171, 42, DEFAULT_OPACITY, 0, KEY(RIGHT), "Right"},
+    {304, 141, 50, DEFAULT_OPACITY, 1, KEY(X), "X"},
+    {250, 192, 50, DEFAULT_OPACITY, 1, KEY(Y), "Y"}
 };
 static const int old_default_positions[CONTROLS][2] = {
     [L] = {18, 16}, [R] = {285, 16}, [MENU_BUTTON] = {18, 260}, [SPEED] = {88, 260},
@@ -75,10 +78,11 @@ static unsigned physical_map[PHYSICAL_COUNT], held_buttons, gameplay_buttons;
 static const struct { unsigned keys; const char *name; } actions[] = {
     {KEY(A), "A"}, {KEY(B), "B"}, {KEY(START), "Start"}, {KEY(SELECT), "Select"},
     {KEY(L), "L"}, {KEY(R), "R"}, {KEY(UP), "Up"}, {KEY(DOWN), "Down"},
-    {KEY(LEFT), "Left"}, {KEY(RIGHT), "Right"}, {KEY(A) | KEY(B), "A+B"}, {0, "Unassigned"}
+    {KEY(LEFT), "Left"}, {KEY(RIGHT), "Right"}, {KEY(A) | KEY(B), "A+B"}, {0, "Unassigned"},
+    {KEY(X), "X"}, {KEY(Y), "Y"}
 };
 static const int touch_choices[] = {TOUCH_A, B, SELECT_BUTTON, START_BUTTON, L, R,
-    TOUCH_UP, TOUCH_DOWN, TOUCH_LEFT, TOUCH_RIGHT, AB, SPEED, QUICK_SAVE, QUICK_LOAD};
+    TOUCH_UP, TOUCH_DOWN, TOUCH_LEFT, TOUCH_RIGHT, AB, SPEED, QUICK_SAVE, QUICK_LOAD, TOUCH_X, TOUCH_Y};
 static int touch_page, assign_page, assign_target;
 static enum Screen assign_return;
 static const char *action_name(unsigned keys) {
@@ -129,17 +133,20 @@ static uint64_t wheel_time, notice_end, next_save;
 static unsigned physical_keys, touch_keys, pressed_this_frame;
 static char notice[95];
 static const char *data_dir = "/mnt/mmc/q2-boy";
-static char rom_dir[PATH_CAP], save_dir[PATH_CAP], game_base[PATH_CAP], config_file[PATH_CAP];
+static LibraryPaths data_paths;
+static char game_base[PATH_CAP], legacy_game_base[PATH_CAP], config_file[PATH_CAP];
 static char active_rom[PATH_CAP];
 enum RomSort { SORT_TITLE, SORT_RECENT, SORT_COUNT };
 static const char *const sort_labels[] = {"Title (A-Z)", "Last played"};
 static const char *const sort_short[] = {"A-Z", "Recent"};
-static const char *const system_names[] = {"Game Boy", "Game Boy Color", "Game Boy Advance"};
-static const char *const system_short[] = {"GB", "GBC", "GBA"};
+static const char *const system_names[] = {"Game Boy", "Game Boy Color", "Game Boy Advance", "NES", "SNES"};
+static const char *const system_short[] = {"GB", "GBC", "GBA", "NES", "SNES"};
+static enum CartridgeSystem active_system = SYSTEM_GBA;
 typedef struct {
     char name[256];
     int title_length, recent_rank;
     enum CartridgeSystem system;
+    bool legacy;
 } Rom;
 typedef struct { int first, end, selected; } RomShelf;
 typedef char RomName[sizeof ((Rom *)0)->name];
@@ -175,11 +182,11 @@ static uint64_t speed_start;
 static unsigned speed_frames, video_frames;
 static double fps = 59.7275;
 
-/* gpSP remains built in. Load the GB/GBC core only when a cartridge needs it. */
+/* gpSP remains built in. Load external cores only when their games are opened. */
 #define CORE_API(X) \
     X(set_environment) X(set_video_refresh) X(set_audio_sample) X(set_audio_sample_batch) \
     X(set_input_poll) X(set_input_state) X(init) X(deinit) X(set_controller_port_device) \
-    X(load_game) X(unload_game) X(get_system_av_info) X(run) X(get_memory_size) \
+    X(load_game) X(unload_game) X(get_system_info) X(get_system_av_info) X(run) X(get_memory_size) \
     X(get_memory_data) X(serialize_size) X(serialize) X(unserialize)
 struct Core {
 #define API_MEMBER(name) __typeof__(&retro_##name) name;
@@ -191,41 +198,53 @@ static const struct Core gpsp = {
     CORE_API(API_GPSP)
 #undef API_GPSP
 };
-static struct Core gambatte;
+typedef struct {
+    const char *filename, *label;
+    struct Core api;
+    void *library;
+} SharedCore;
+
+enum SharedCoreId { GAMBATTE, FCEUMM, SNES9X2005, SHARED_CORES };
+static SharedCore shared_cores[SHARED_CORES] = {
+    [GAMBATTE] = {.filename = "gambatte_libretro.so", .label = "Gambatte"},
+    [FCEUMM] = {.filename = "fceumm_libretro.so", .label = "FCEUmm"},
+    [SNES9X2005] = {.filename = "snes9x2005_libretro.so", .label = "Snes9x 2005"}
+};
 static const struct Core *core;
-static void *gambatte_library;
 static char app_dir[PATH_CAP];
-static unsigned cart_width = CART_WIDTH, cart_height = CART_HEIGHT;
+static unsigned cart_width = GBA_WIDTH, cart_height = GBA_HEIGHT;
 static unsigned smoke_audio_frames;
 
-enum RomType { ROM_UNKNOWN, ROM_GBA, ROM_GB };
-static enum RomType rom_type(const char *path) {
-    const char *extension = strrchr(path, '.');
-    if (!extension) return ROM_UNKNOWN;
-    if (!strcasecmp(extension, ".gba")) return ROM_GBA;
-    if (!strcasecmp(extension, ".gb") || !strcasecmp(extension, ".gbc")) return ROM_GB;
-    return ROM_UNKNOWN;
-}
-static bool enable_gambatte(void) {
-    if (gambatte_library) return true;
+static bool load_shared_core(SharedCore *module) {
+    if (module->library) return true;
     char path[PATH_CAP];
-    int length = snprintf(path, sizeof path, "%s/gambatte_libretro.so", app_dir);
+    int length = snprintf(path, sizeof path, "%s/%s", app_dir, module->filename);
     if (length < 0 || length >= (int)sizeof path) return false;
     void *handle = dlopen(path, RTLD_NOW | RTLD_LOCAL);
     if (!handle) {
-        fprintf(stderr, "Gambatte unavailable: %s\n", dlerror());
+        fprintf(stderr, "%s unavailable: %s\n", module->label, dlerror());
         return false;
     }
 #define API_LOAD(name) \
     do { \
-        gambatte.name = (__typeof__(gambatte.name))dlsym(handle, "retro_" #name); \
-        if (!gambatte.name) { fprintf(stderr, "Gambatte lacks retro_%s\n", #name); dlclose(handle); return false; } \
+        module->api.name = (__typeof__(module->api.name))dlsym(handle, "retro_" #name); \
+        if (!module->api.name) { \
+            fprintf(stderr, "%s lacks retro_%s\n", module->label, #name); \
+            dlclose(handle); \
+            return false; \
+        } \
     } while (0);
     CORE_API(API_LOAD)
 #undef API_LOAD
-    gambatte_library = handle;
+    module->library = handle;
     return true;
 }
+
+static void close_shared_cores(void) {
+    for (int i = 0; i < SHARED_CORES; ++i)
+        if (shared_cores[i].library) dlclose(shared_cores[i].library);
+}
+
 static void initialize_core(const struct Core *selected);
 static void release_core(void) {
     if (core) { core->deinit(); core = NULL; }
@@ -242,7 +261,7 @@ static void locate_app(const char *argv0) {
 static int clamp(int x, int low, int high) { return x < low ? low : x > high ? high : x; }
 /* 2x has headroom with the original path. At higher targets pace video by
  * elapsed time, leaving extra GBA frames to advance without a panel update. */
-static bool paced_video(void) { return screen == GAME && fast && (fast_rate >= 3 || core == &gambatte); }
+static bool paced_video(void) { return screen == GAME && fast && (fast_rate >= 3 || core != &gpsp); }
 static void schedule_video(uint64_t now) {
     allow_video = screen == GAME && (!paced_video() || !next_video || now >= next_video);
     if (paced_video() && allow_video) {
@@ -319,12 +338,22 @@ static void put_button(int which, const char *label) {
     text_at(b->x + (b->size - label_width) / 2, b->y + (h - 17) / 2,
             label, WHITE, b->x + b->size);
 }
+static bool overlay_visible(int index) {
+    const Button *button = &buttons[index];
+    if (!button->visible) return false;
+    if (active_system != SYSTEM_SNES && (index >= TOUCH_X || (button->keys & (KEY(X) | KEY(Y))))) return false;
+    return active_system != SYSTEM_NES || !(button->keys & (KEY(L) | KEY(R)));
+}
+
 static void draw_game(void) {
     int w = WIDTH, h = HEIGHT, base_x = 0, base_y = 0;
-    bool panel_is_narrower = WIDTH * cart_height <= HEIGHT * cart_width;
+    /* TV consoles use the 4:3 display shape. Preserve handheld pixel geometry. */
+    unsigned aspect_w = active_system >= SYSTEM_NES ? 4 : cart_width;
+    unsigned aspect_h = active_system >= SYSTEM_NES ? 3 : cart_height;
+    bool panel_is_narrower = WIDTH * aspect_h <= HEIGHT * aspect_w;
     if (scaling != STRETCH) {
-        if (panel_is_narrower == (scaling == FIT)) h = WIDTH * cart_height / cart_width;
-        else w = HEIGHT * cart_width / cart_height;
+        if (panel_is_narrower == (scaling == FIT)) h = WIDTH * aspect_h / aspect_w;
+        else w = HEIGHT * aspect_w / aspect_h;
         base_x = (WIDTH - w) / 2;
         base_y = (HEIGHT - h) / 2;
     }
@@ -339,7 +368,7 @@ static void draw_game(void) {
         for (int x = left; x < right; ++x) dest[x] = source[lookup[x]];
     }
     for (int i = 0; i < CONTROLS; ++i) {
-        if (!buttons[i].visible) continue;
+        if (!overlay_visible(i)) continue;
         char label[12];
         const char *name = button_label(i, &buttons[i]);
         if (i == QUICK_SAVE || i == QUICK_LOAD) {
@@ -450,17 +479,59 @@ static void audio_poll(uint64_t now) {
         status("Q2 audio request timed out");
     }
 }
+static int write_overlay(char *buffer, size_t remaining, const Button *b) {
+    return snprintf(buffer, remaining, "%d %d %d %d %d %u\n",
+                    b->x, b->y, b->size, b->opacity, b->visible, b->keys);
+}
+
 static void store_config(void) {
     char buffer[768];
-    int used = snprintf(buffer, sizeof buffer, "%d 8 %d %d\n", scaling, fast_rate, local_volume);
-    for (int i = 0; i < CONTROLS; ++i) {
-        const Button *b = &buttons[i];
-        used += snprintf(buffer + used, sizeof buffer - used, "%d %d %d %d %d %u\n",
-                         b->x, b->y, b->size, b->opacity, b->visible, b->keys);
-    }
+    int used = snprintf(buffer, sizeof buffer, "%d 9 %d %d\n", scaling, fast_rate, local_volume);
+    for (int i = 0; i < TOUCH_X; ++i)
+        used += write_overlay(buffer + used, sizeof buffer - used, &buttons[i]);
     for (int i = 0; i < PHYSICAL_COUNT; ++i)
         used += snprintf(buffer + used, sizeof buffer - used, "%u\n", physical_map[i]);
+    /* Keep the older layout intact when reverting to a previous build. */
+    for (int i = TOUCH_X; i < CONTROLS; ++i)
+        used += write_overlay(buffer + used, sizeof buffer - used, &buttons[i]);
     if (!file_write(config_file, buffer, used)) status("Could not save overlay settings");
+}
+static bool read_overlay(FILE *f, int version, int row) {
+    char line[80];
+    int x, y, size, alpha, show;
+    unsigned keys = 0;
+    if (!fgets(line, sizeof line, f) ||
+        sscanf(line, "%d %d %d %d %d %u", &x, &y, &size, &alpha, &show, &keys) < (version < 6 ? 5 : 6))
+        return false;
+    int which = version < 3 ? previous_overlays[row] : row;
+    if (which < 0) return true;
+    Button *b = &buttons[which];
+    if (version < 2) {
+        const int *old = legacy_geometry[row];
+        if (x == old[0] && y == old[1]) { x = b->x; y = b->y; }
+        if (size == old[2]) size = b->size;
+    } else if (version == 2 && y == 260 &&
+               ((which == QUICK_SAVE && x == 122) || (which == QUICK_LOAD && x == 174))) {
+        y = b->y;
+    }
+    if (version < 4) {
+        if (which == MENU_BUTTON && size == 44) size = b->size;
+        if (which == SPEED && y == 260 && (x == 66 || x == 70)) x = b->x;
+    }
+    if (version < 7) {
+        if (size == b->size && x == old_default_positions[which][0] &&
+            y == old_default_positions[which][1]) { x = b->x; y = b->y; }
+        if (alpha == old_default_opacity[which]) alpha = b->opacity;
+    } else if (version == 7 && size == b->size &&
+               x == test_default_positions[which][0] && y == test_default_positions[which][1]) {
+        x = b->x;
+    }
+    b->size = clamp(size, 36, 88);
+    move_button(which, x, y);
+    b->opacity = clamp(alpha, 16, 100);
+    b->visible = which == MENU_BUTTON || show != 0;
+    if (version >= 6 && remappable_overlay(which) && valid_action(keys)) b->keys = keys;
+    return true;
 }
 static void load_config(void) {
     memcpy(buttons, defaults, sizeof buttons);
@@ -474,42 +545,10 @@ static void load_config(void) {
     platform_audio_attenuation(local_volume);
     if (saved_scale >= FIT && saved_scale <= STRETCH) scaling = saved_scale;
     if (rate == 2 || rate == 3 || rate == 5) fast_rate = rate == 5 ? 3 : rate;
-    int rows = version < 3 ? (int)(sizeof previous_overlays / sizeof previous_overlays[0]) : version < 6 ? TOUCH_A : CONTROLS;
-    for (int row = 0; row < rows; ++row) {
-        int x, y, size, alpha, show;
-        unsigned keys = 0;
-        if (!fgets(line, sizeof line, f) ||
-            sscanf(line, "%d %d %d %d %d %u", &x, &y, &size, &alpha, &show, &keys) < (version < 6 ? 5 : 6))
-            break;
-        int which = version < 3 ? previous_overlays[row] : row;
-        if (which < 0) continue;
-        Button *b = &buttons[which];
-        if (version < 2) {
-            const int *old = legacy_geometry[row];
-            if (x == old[0] && y == old[1]) { x = b->x; y = b->y; }
-            if (size == old[2]) size = b->size;
-        } else if (version == 2 && y == 260 &&
-                   ((which == QUICK_SAVE && x == 122) || (which == QUICK_LOAD && x == 174))) {
-            y = b->y;
-        }
-        if (version < 4) {
-            if (which == MENU_BUTTON && size == 44) size = b->size;
-            if (which == SPEED && y == 260 && (x == 66 || x == 70)) x = b->x;
-        }
-        if (version < 7) {
-            if (size == b->size && x == old_default_positions[which][0] &&
-                y == old_default_positions[which][1]) { x = b->x; y = b->y; }
-            if (alpha == old_default_opacity[which]) alpha = b->opacity;
-        } else if (version == 7 && size == b->size &&
-                   x == test_default_positions[which][0] && y == test_default_positions[which][1]) {
-            x = b->x;
-        }
-        b->size = clamp(size, 36, 88);
-        move_button(which, x, y);
-        b->opacity = clamp(alpha, 16, 100);
-        b->visible = which == MENU_BUTTON || show != 0;
-        if (version >= 6 && remappable_overlay(which) && valid_action(keys)) b->keys = keys;
-    }
+    int rows = version < 3 ? (int)(sizeof previous_overlays / sizeof previous_overlays[0]) :
+               version < 6 ? TOUCH_A : TOUCH_X;
+    for (int row = 0; row < rows; ++row)
+        if (!read_overlay(f, version, row)) break;
     if (version >= 6) {
         for (int i = 0; i < PHYSICAL_COUNT; ++i) {
             unsigned keys;
@@ -517,17 +556,29 @@ static void load_config(void) {
             if (sscanf(line, "%u", &keys) == 1 && valid_action(keys)) physical_map[i] = keys;
         }
     }
+    if (version >= 9) {
+        for (int row = TOUCH_X; row < CONTROLS; ++row)
+            if (!read_overlay(f, version, row)) break;
+    }
     fclose(f);
 }
-static bool state_path(char *path, int number) {
+static bool save_path(char path[PATH_CAP], const char *suffix, bool writing) {
+    if (!file_path(path, PATH_CAP, game_base, suffix)) return false;
+    struct stat64 st;
+    if (!writing && lstat64(path, &st) && (errno == ENOENT || errno == ENOTDIR))
+        return file_path(path, PATH_CAP, legacy_game_base, suffix);
+    return true;
+}
+
+static bool state_path(char path[PATH_CAP], int number, bool writing) {
     char extension[24];
     snprintf(extension, sizeof extension, ".state%02d", number + 1);
-    return file_path(path, PATH_CAP, game_base, extension);
+    return save_path(path, extension, writing);
 }
 static bool state_info(int number, time_t *when) {
     struct stat st;
     char path[PATH_CAP];
-    if (!state_path(path, number) || stat(path, &st) != 0 || !S_ISREG(st.st_mode)) return false;
+    if (!state_path(path, number, false) || stat(path, &st) != 0 || !S_ISREG(st.st_mode)) return false;
     if (when) *when = st.st_mtime;
     return true;
 }
@@ -535,7 +586,7 @@ static void battery_io(unsigned kind, const char *suffix, bool save) {
     char path[PATH_CAP];
     size_t size = core->get_memory_size(kind);
     void *data = core->get_memory_data(kind);
-    if (!size || !data || !file_path(path, sizeof path, game_base, suffix)) return;
+    if (!size || !data || !save_path(path, suffix, save)) return;
     if (save) {
         if (!file_write(path, data, size)) status("Could not write in-game save");
     } else {
@@ -545,12 +596,13 @@ static void battery_io(unsigned kind, const char *suffix, bool save) {
 }
 static void cartridge_saves(bool save) {
     battery_io(RETRO_MEMORY_SAVE_RAM, ".srm", save);
-    if (core == &gambatte) battery_io(RETRO_MEMORY_RTC, ".rtc", save);
+    if (core == &shared_cores[GAMBATTE].api || core == &shared_cores[SNES9X2005].api)
+        battery_io(RETRO_MEMORY_RTC, ".rtc", save);
 }
 static bool state_io(enum Action action, int number) {
     size_t length = core->serialize_size();
     char path[PATH_CAP];
-    if (!length || !state_path(path, number)) return false;
+    if (!length || !state_path(path, number, action == SAVE)) return false;
     void *data = malloc(length);
     if (!data) return false;
     bool ok = false;
@@ -653,13 +705,6 @@ static int rom_compare(const void *left, const void *right) {
     return compare ? compare : strcmp(a->name, b->name);
 }
 
-static enum CartridgeSystem rom_system(const char *name) {
-    const char *ext = strrchr(name, '.');
-    if (ext && !strcasecmp(ext, ".gba")) return SYSTEM_GBA;
-    if (ext && !strcasecmp(ext, ".gbc")) return SYSTEM_GBC;
-    return SYSTEM_GB;
-}
-
 static bool shelf_has_games(const RomShelf *page) { return page->first < page->end; }
 
 static void remember_highlights(RomName names[SYSTEM_COUNT]) {
@@ -700,33 +745,53 @@ static void sort_library(RomName names[SYSTEM_COUNT]) {
     dirty = 1;
 }
 
+static const char *rom_directory(const Rom *rom) {
+    return rom->legacy ? data_paths.roms : data_paths.system_roms[rom->system];
+}
+
+static bool name_already_indexed(const char *name) {
+    for (int i = 0; i < rom_count; ++i)
+        if (!strcasecmp(roms[i].name, name)) return true;
+    return false;
+}
+
+static void scan_rom_directory(const char *directory, enum CartridgeSystem expected) {
+    DIR *dir = opendir(directory);
+    if (!dir) return;
+    struct dirent64 *entry;
+    while (rom_count < ROM_LIMIT && (entry = readdir64(dir))) {
+        const char *name = entry->d_name;
+        enum CartridgeSystem system = rom_system(name);
+        bool legacy = expected == SYSTEM_COUNT;
+        if (name[0] == '.' || system == SYSTEM_COUNT || (!legacy && system != expected) ||
+            (legacy && name_already_indexed(name))) continue;
+        char path[PATH_CAP];
+        struct stat64 st;
+        if (!join_path(path, directory, name) || stat64(path, &st) || !S_ISREG(st.st_mode)) continue;
+        Rom *rom = &roms[rom_count++];
+        strcpy(rom->name, name);
+        rom->title_length = (int)(strrchr(rom->name, '.') - rom->name);
+        rom->system = system;
+        rom->legacy = legacy;
+    }
+    closedir(dir);
+}
+
 static void scan_roms(void) {
     RomName selected[SYSTEM_COUNT];
     remember_highlights(selected);
     if (!rom_count && recent_count) {
         enum CartridgeSystem system = rom_system(library.recent[0]);
-        shelf = &shelves[system];
-        strcpy(selected[system], library.recent[0]);
+        if (system != SYSTEM_COUNT) {
+            shelf = &shelves[system];
+            strcpy(selected[system], library.recent[0]);
+        }
     }
     rom_count = 0;
     cover_clear();
-    DIR *dir = opendir(rom_dir);
-    if (dir) {
-        struct dirent64 *entry;
-        while ((entry = readdir64(dir)) && rom_count < ROM_LIMIT) {
-            if (entry->d_name[0] == '.' || rom_type(entry->d_name) == ROM_UNKNOWN) continue;
-            char path[PATH_CAP];
-            int length = snprintf(path, sizeof path, "%s/%s", rom_dir, entry->d_name);
-            struct stat64 st;
-            if (length < 0 || (size_t)length >= sizeof path || stat64(path, &st) || !S_ISREG(st.st_mode)) continue;
-            Rom *rom = &roms[rom_count++];
-            strcpy(rom->name, entry->d_name);
-            const char *ext = strrchr(rom->name, '.');
-            rom->title_length = (int)(ext - rom->name);
-            rom->system = rom_system(rom->name);
-        }
-        closedir(dir);
-    }
+    for (int system = 0; system < SYSTEM_COUNT; ++system)
+        scan_rom_directory(data_paths.system_roms[system], system);
+    scan_rom_directory(data_paths.roms, SYSTEM_COUNT);
     sort_library(selected);
 }
 
@@ -748,21 +813,33 @@ static void close_rom(void);
 static bool load_rom(const char *path) {
     const char *name = strrchr(path, '/');
     name = name ? name + 1 : path;
-    char base[PATH_CAP];
-    int n = snprintf(base, sizeof base, "%s/%s", save_dir, name);
-    if (n < 0 || (size_t)n >= sizeof base || strlen(path) >= sizeof active_rom) return false;
-    struct stat file;
-    if (stat(path, &file) || !S_ISREG(file.st_mode) || file.st_size < 192 ||
+    enum CartridgeSystem system = rom_system(path);
+    char base[PATH_CAP], legacy_base[PATH_CAP];
+    if (system == SYSTEM_COUNT || strlen(path) >= sizeof active_rom ||
+        !join_path(base, data_paths.system_saves[system], name) ||
+        !join_path(legacy_base, data_paths.saves, name)) return false;
+    struct stat64 file;
+    if (stat64(path, &file) || !S_ISREG(file.st_mode) || file.st_size < 192 ||
         (uint64_t)file.st_size > 32 * 1024 * 1024ull) return false;
-    enum RomType type = rom_type(path);
-    if (type == ROM_UNKNOWN) return false;
-    if (type == ROM_GB && !enable_gambatte()) {
-        status("Game Boy core missing from .boy folder");
-        return false;
+    const struct Core *selected = &gpsp;
+    const char *label = use_dynarec ? "gpSP dynarec" : "gpSP interpreter";
+    if (system != SYSTEM_GBA) {
+        enum SharedCoreId id = system == SYSTEM_NES ? FCEUMM : system == SYSTEM_SNES ? SNES9X2005 : GAMBATTE;
+        SharedCore *module = &shared_cores[id];
+        if (!load_shared_core(module)) {
+            char message[75];
+            snprintf(message, sizeof message, "%s core unavailable in .boy", module->label);
+            status(message);
+            return false;
+        }
+        selected = &module->api;
+        label = module->label;
     }
+    struct retro_system_info system_info = {0};
+    selected->get_system_info(&system_info);
     struct retro_game_info info = {.path = path};
     void *rom_data = NULL;
-    if (type == ROM_GB) {
+    if (!system_info.need_fullpath) {
         rom_data = malloc(file.st_size);
         FILE *rom = rom_data ? fopen(path, "rb") : NULL;
         bool read = rom && fread(rom_data, 1, file.st_size, rom) == (size_t)file.st_size;
@@ -772,12 +849,11 @@ static bool load_rom(const char *path) {
         info.size = file.st_size;
     }
     if (running) close_rom();
-    initialize_core(type == ROM_GBA ? &gpsp : &gambatte);
-    fprintf(stderr, "Opening %s (%ld bytes), core=%s\n", name, (long)file.st_size,
-            type == ROM_GB ? "Gambatte" : use_dynarec ? "gpSP dynarec" : "gpSP interpreter");
+    initialize_core(selected);
+    fprintf(stderr, "Opening %s (%ld bytes), core=%s\n", name, (long)file.st_size, label);
     launch_stage = 1;
     bool loaded = core->load_game(&info);
-    free(rom_data); /* Gambatte copies the cartridge on load. */
+    free(rom_data);
     if (!loaded) {
         launch_stage = 0;
         release_core();
@@ -786,7 +862,7 @@ static bool load_rom(const char *path) {
     launch_stage = 2;
     struct retro_system_av_info av = {0};
     core->get_system_av_info(&av);
-    fps = av.timing.fps > 50 && av.timing.fps < 65 ? av.timing.fps : 59.7275;
+    fps = av.timing.fps >= 45 && av.timing.fps <= 65 ? av.timing.fps : 59.7275;
     cart_width = av.geometry.base_width;
     cart_height = av.geometry.base_height;
     if (!cart_width || !cart_height || cart_width > CART_WIDTH || cart_height > CART_HEIGHT) {
@@ -796,7 +872,9 @@ static bool load_rom(const char *path) {
     }
     if (!smoke && av.timing.sample_rate >= 8000 && av.timing.sample_rate <= 192000)
         platform_audio_set_rate((unsigned)(av.timing.sample_rate + 0.5));
+    active_system = system;
     strcpy(game_base, base);
+    strcpy(legacy_game_base, legacy_base);
     strcpy(active_rom, path);
     cartridge_saves(false);
     running = 1;
@@ -813,7 +891,8 @@ static void launch_selected(void) {
     char path[PATH_CAP];
     if (!shelf_has_games(shelf)) return;
     notice_end = 0;
-    if (snprintf(path, sizeof path, "%s/%s", rom_dir, roms[shelf->selected].name) >= (int)sizeof path) return;
+    const Rom *rom = &roms[shelf->selected];
+    if (!join_path(path, rom_directory(rom), rom->name)) return;
     if (running && !strcmp(active_rom, path)) { set_screen(GAME); return; }
 
     char previous[PATH_CAP];
@@ -917,6 +996,7 @@ static int menu_items(MenuItem *items) {
         int page = screen == TOUCH ? touch_page : assign_page;
         int total = screen == TOUCH ? (int)(sizeof touch_choices / sizeof touch_choices[0])
                                     : (int)(sizeof actions / sizeof actions[0]);
+        if (active_system != SYSTEM_SNES) total -= 2;
         for (int i = 0; i < 6; ++i) {
             int k = page * 6 + i;
             if (k >= total) break;
@@ -1016,7 +1096,9 @@ static void draw_shelf(const RomShelf *page, float position, int offset_y, uint6
     /* Paint farther cards first so the active cover overlaps its neighbors. */
     while (left <= right) {
         int i = position - left > right - position ? left++ : right--;
-        cover_draw(canvas, rom_dir, roms[i].name, roms[i].system, i - position, offset_y);
+        const Rom *rom = &roms[i];
+        cover_draw(canvas, rom_directory(rom), rom->legacy ? NULL : data_paths.roms,
+                   rom->name, rom->system, i - position, offset_y);
     }
     char title[256], sub[64];
     selected_title(mid, title);
@@ -1197,7 +1279,7 @@ static void draw_ui(void) {
 static int hit(int x, int y) {
     for (int i = CONTROLS - 1; i >= 0; --i) {
         const Button *b = &buttons[i];
-        if (b->visible && inside_shape(x - b->x, y - b->y, b->size,
+        if (overlay_visible(i) && inside_shape(x - b->x, y - b->y, b->size,
                                        button_height(i, b), button_radius(i, b))) return i;
     }
     return -1;
@@ -1337,7 +1419,7 @@ static void activate_menu(int index) {
     case EDIT: {
         Button *b = &buttons[edit_button];
         if (index == 0) {
-            do { edit_button = (edit_button + 1) % CONTROLS; } while (!buttons[edit_button].visible);
+            do { edit_button = (edit_button + 1) % CONTROLS; } while (!overlay_visible(edit_button));
         } else if (index <= 2) {
             b->size = clamp(b->size + (index == 1 ? -4 : 4), 36, 88);
             move_button(edit_button, b->x, b->y);
@@ -1389,7 +1471,9 @@ static void tap_cover(int x, int y) {
          i < shelf->end && i <= mid + 4; ++i) {
         float offset = i - flow_position;
         float distance = offset < 0 ? -offset : offset;
-        if (distance < best && cover_hit(rom_dir, roms[i].name, roms[i].system, offset, x, y)) {
+        const Rom *rom = &roms[i];
+        if (distance < best && cover_hit(rom_directory(rom), rom->legacy ? NULL : data_paths.roms,
+                                        rom->name, rom->system, offset, x, y)) {
             closest = i;
             best = distance;
         }
@@ -1518,6 +1602,12 @@ static void read_wheel(int delta) {
         else step_menu(step);
     }
 }
+static unsigned mapped_button(int id) {
+    unsigned keys = physical_map[id];
+    if (active_system != SYSTEM_SNES && (keys & (KEY(X) | KEY(Y)))) return physical_defaults[id];
+    return keys;
+}
+
 static int decode_key(Event e) {
     if (e.kind == 'g') {
         switch (e.x) { // Linux md-gpio-keys codes
@@ -1554,7 +1644,7 @@ static void read_event(Event e) {
         held_buttons |= bit;
         if (screen == GAME) {
             gameplay_buttons |= bit;
-            pressed_this_frame |= physical_map[id];
+            pressed_this_frame |= mapped_button(id);
         } else if (id == P_CENTRE) {
             if (screen == BROWSER) launch_selected();
             else activate_menu(menu_focus);
@@ -1570,7 +1660,7 @@ static void read_event(Event e) {
     }
     physical_keys = 0;
     for (int i = 0; i < PHYSICAL_COUNT; ++i)
-        if (gameplay_buttons & (1u << i)) physical_keys |= physical_map[i];
+        if (gameplay_buttons & (1u << i)) physical_keys |= mapped_button(i);
 }
 static void log_core(enum retro_log_level level, const char *message, ...) {
     if (level < RETRO_LOG_INFO) return;
@@ -1615,8 +1705,10 @@ static bool environment(unsigned command, void *data) {
     }
 }
 static void video_frame(const void *data, unsigned w, unsigned h, size_t pitch) {
-    if (screen != GAME || !data || w != cart_width || h != cart_height || pitch < w * sizeof(uint16_t) ||
-        (core == &gambatte && !allow_video)) return;
+    if (screen != GAME || !data || !w || !h || w > CART_WIDTH || h > CART_HEIGHT ||
+        pitch < w * sizeof(uint16_t) || (core != &gpsp && !allow_video)) return;
+    cart_width = w;
+    cart_height = h;
     ++video_frames;
     for (unsigned y = 0; y < h; ++y) {
         const uint16_t *line = (const uint16_t *)((const char *)data + y * pitch);
@@ -1667,24 +1759,17 @@ static void initialize_core(const struct Core *selected) {
     core->set_controller_port_device(0, RETRO_DEVICE_JOYPAD);
 }
 static bool prepare_dirs(void) {
-    if (!file_path(rom_dir, sizeof rom_dir, data_dir, "/ROMs") ||
-        !file_path(save_dir, sizeof save_dir, data_dir, "/Saves") ||
-        !file_path(config_file, sizeof config_file, data_dir, "/controls.cfg") ||
-        !file_path(library_file, sizeof library_file, data_dir, "/library.cfg")) return false;
-    const char *dirs[] = {data_dir, rom_dir, save_dir};
-    for (unsigned i = 0; i < sizeof dirs / sizeof dirs[0]; ++i) {
-        struct stat st;
-        if (mkdir(dirs[i], 0755) && (stat(dirs[i], &st) || !S_ISDIR(st.st_mode))) return false;
-    }
-    return true;
+    return join_path(config_file, data_dir, "controls.cfg") &&
+           join_path(library_file, data_dir, "library.cfg") &&
+           library_prepare(&data_paths, data_dir);
 }
 static int smoke_test(const char *path) {
     if (!load_rom(path)) return 1;
     smoke_audio_frames = 0;
     for (int i = 0; i < 15; ++i) core->run();
     if (!have_frame || !smoke_audio_frames ||
-        (core == &gpsp && cart[80 * CART_WIDTH + 120] != RGB(0xff0000)) ||
-        (core == &gambatte && (cart_width != 160 || cart_height != 144))) {
+        (core == &gpsp && cart[80 * GBA_WIDTH + 120] != RGB(0xff0000)) ||
+        (core == &shared_cores[GAMBATTE].api && (cart_width != 160 || cart_height != 144))) {
         close_rom();
         return 2;
     }
@@ -1877,7 +1962,7 @@ static void log_launch(void) {
     sigaction(SIGSEGV, &action, NULL);
     sigaction(SIGABRT, &action, NULL);
     sigaction(SIGFPE, &action, NULL);
-    fprintf(stderr, "\nq2-boy 0.2.6, engine=%s\n",
+    fprintf(stderr, "\nq2-boy 0.3.1, engine=%s\n",
             use_dynarec ? "dynamic recompiler (opt-in)" : "interpreter");
     FILE *memory = fopen("/proc/meminfo", "r");
     if (memory) {
@@ -1923,11 +2008,12 @@ int main(int argc, char **argv) {
         int result = smoke_test(argv[2]);
         for (int i = 4; !result && i < argc; ++i) result = smoke_test(argv[i]);
         release_core();
-        if (gambatte_library) dlclose(gambatte_library);
+        close_shared_cores();
         return result;
     }
     if (!raw_buttons && !native_supported) status("Limited input: holding Up may exit");
     load_library();
+    library_migrate(&data_paths);
     scan_roms();
     uint64_t next_frame = 0;
     while (!quitting) {
@@ -1969,7 +2055,7 @@ int main(int argc, char **argv) {
         if (!advance || clock_ns() < next_frame) usleep(1000);
     }
     close_rom();
-    if (gambatte_library) dlclose(gambatte_library);
+    close_shared_cores();
     platform_close();
     fprintf(stderr, "Exited cleanly\n");
     return 0;

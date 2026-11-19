@@ -2,12 +2,20 @@
 
 <img src="assets/mascot.png" width="220" alt="Pixel-art q2-boy mascot holding a click-wheel player">
 
-A native Game Boy, Game Boy Color, and Game Boy Advance emulator frontend
-for the Shanling Q2 running Q2-Pod. It appears as **Pocket Boy** in **Library → Games**.
-The ROM picker runs `.gb` and `.gbc` with [Gambatte](https://github.com/libretro/gambatte)
-and `.gba` with [gpSP](https://github.com/libretro/gpsp) automatically.
-All three share the same controls, menus, display options, save slots, and
-2×/3× fast-forward options. No ROMs or original Nintendo BIOS are shipped.
+A native emulator frontend for the Shanling Q2 running Q2-Pod. It appears
+as **Pocket Boy** in **Library → Games**. The ROM picker selects the core automatically.
+
+| System | Folder | ROM extensions | Core |
+| --- | --- | --- | --- |
+| Game Boy | `gb` | `.gb` | [Gambatte](https://github.com/libretro/gambatte) |
+| Game Boy Color | `gbc` | `.gbc` | Gambatte |
+| Game Boy Advance | `gba` | `.gba` | [gpSP](https://github.com/libretro/gpsp) |
+| NES | `nes` | `.nes` | [FCEUmm](https://github.com/libretro/libretro-fceumm) |
+| Super NES | `snes` | `.sfc`, `.smc` | [Snes9x 2005](https://github.com/libretro/snes9x2005) |
+
+All systems share the same menus, display options, save slots, and 2×/3×
+fast-forward settings. Actual fast-forward speed depends on the game.
+The archive includes no commercial ROMs or Nintendo BIOS files.
 
 The standard Q2-Pod 1.8.8 card-game launcher is sufficient for emulation,
 controls, game audio, save states, and fast-forward. Background Q2 music
@@ -19,9 +27,10 @@ Firmware with that bridge keeps music already playing when q2-boy opens.
 1. Download the latest q2-boy ZIP from [Releases](https://github.com/SlayTheEarth/q2-boy/releases/latest).
    Extract it and copy the packaged `.boy` directory to the root of the SD
    card. Enable hidden files if your file manager hides the directory.
-2. Copy your `.gb`, `.gbc`, and `.gba` ROM files into `q2-boy/ROMs` on the same card.
-3. Open **Library → Games → Pocket Boy**. On a fresh install the app creates
-   the `q2-boy` data folder at first launch.
+2. Open **Library → Games → Pocket Boy** to create the SD card folders.
+3. Copy your ROMs into the matching system folder under `q2-boy/ROMs`.
+   Save RAM, RTC files, and save states go under the same system name in
+   `q2-boy/Saves`.
 
 The ZIP's `Source` folder is for rebuilding the app. Only `.boy` goes on
 the SD card when installing the app.
@@ -31,11 +40,18 @@ On first launch q2-boy moves the previous data folder into `q2-boy` if
 that folder does not exist. If both data folders exist, copy any ROMs,
 saves, and settings you want to keep into the new folder.
 
+Pocket Boy moves legacy files from the flat `ROMs` folder into their
+system folders when it starts. Matching cover art follows the ROM.
+Shared covers are copied to each system and the original is kept.
+Legacy save files are copied to the system folders with their original
+filenames. Existing destination files take priority. If any old files
+remain, Pocket Boy can still read them from the flat folders.
+
 ## ROM library and artwork
 
 Pocket Boy opens in **Cover Flow**. Swipe up to advance through the Game Boy,
-Game Boy Color, and Game Boy Advance shelves, or swipe down to go back. Empty
-systems are skipped. A marker on the right shows which shelf is open. Pocket
+Game Boy Color, Game Boy Advance, NES, and SNES shelves. Swipe down to go
+back. Empty systems are skipped. A marker on the right shows which shelf is open. Pocket
 Boy opens on the last played system, or the first available system on a fresh
 install, starting with Game Boy.
 
@@ -47,7 +63,7 @@ game is running.
 Add a `.png`, `.jpg`, or `.jpeg` beside the ROM using the same base name,
 including spaces and punctuation. For example, place
 `Pokemon - Emerald Version.jpg` beside `Pokemon - Emerald Version.gba` in
-`q2-boy/ROMs`. If several matching images are present, Pocket Boy tries PNG
+`q2-boy/ROMs/gba`. If several matching images are present, Pocket Boy tries PNG
 first, then JPG and JPEG. PNG supports up to 1024 pixels per side and JPEG
 up to 2048, with an 8 MiB file limit. Covers keep their proportions. Games
 without readable artwork get a cartridge icon.
@@ -62,14 +78,17 @@ Pocket Boy remembers the sort and view on the SD card.
 By default, the Q2's Return, Play/Pause, Previous, and Next buttons act as
 Up, Down, Left, and Right during play. Centre acts as A. B, L, R, Start,
 Select, and Menu are visible touchscreen overlays.
-Their backgrounds default to 30% transparency. L and R sit higher and
-farther in from the corners. Menu, Select, and Start sit near the bottom.
+SNES adds X and Y touchscreen buttons on the right. NES hides the default
+shoulder buttons. Their backgrounds default to 30% transparency. Menu,
+Select, and Start sit near the bottom. NES and SNES use a 4:3 picture
+with the default Fit setting.
 
 - **Menu → Display and controls → Physical buttons** assigns each of the
   five Q2 buttons to a cartridge action. Remaps apply during gameplay. Centre
   still confirms and Return still goes back in menus.
-- **Touch buttons** toggles individual overlays. It includes every Game Boy Advance
-  button, plus A+B and shortcuts for fast-forward and quick save/load.
+- **Touch buttons** toggles individual overlays, including SNES X and Y
+  while playing SNES. It also includes A+B and shortcuts for fast-forward
+  and quick save/load.
 - **Move, resize, or fade buttons** edits the overlays. Choose an overlay
   and use **Assign action** to remap a gameplay overlay. Menu remains
   available so there's always a way back.
@@ -83,6 +102,8 @@ background. Choose **Resume** to return to it, or select another cartridge.
 
 See [building and integration](docs/BUILD.md). The frontend is licensed
 under GPL-2.0-or-later, with the combined gpSP build distributed under GPL
-version 2. The separately loaded Gambatte core is GPL-2.0-only.
+version 2. The separately loaded Gambatte and FCEUmm cores are GPL-2.0-only.
+The separately loaded Snes9x 2005 core is distributed for non-commercial use
+under its own license. See the core notices in the Source folder.
 The optional Q2-Pod changes are GPL-3.0-only. The font has its
 own [license and attribution](src/FONT-LICENSE).

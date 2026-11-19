@@ -32,6 +32,13 @@ git clone https://github.com/libretro/gambatte.git deps/gambatte
 git -C deps/gambatte checkout 77f2567d718b8973d02caa2daa8dce4953faf811
 export CXX_HEADERS=/absolute/path/to/extracted/headers
 GAMBATTE="$PWD/deps/gambatte" sh src/build-gambatte.sh dist/.boy/gambatte_libretro.so
+
+git clone https://github.com/libretro/libretro-fceumm.git deps/fceumm
+git -C deps/fceumm checkout 77468e568d9fe9c48d684ca911f1a3fe7259fdf7
+git clone https://github.com/libretro/snes9x2005.git deps/snes9x2005
+git -C deps/snes9x2005 checkout a79dfe9047e7fec58808aefe48ad2bf499c7af11
+FCEUMM="$PWD/deps/fceumm" SNES9X2005="$PWD/deps/snes9x2005" \
+  sh src/build-home-cores.sh dist/.boy
 ```
 
 For an SD release, zip the contents of `dist` at the archive root,
@@ -51,9 +58,14 @@ change is tracked in [PR #426](https://github.com/DiamondBond/q2-pod/pull/426).
 
 `tests/smoke.s` is a tiny homebrew GBA program and
 `python3 tests/make-gb-fixtures.py /path/to/fixtures` generates original
-GB and GBC test ROMs. Use
-`--smoke /path/to/test.gba /path/to/test-directory /path/to/core-qa.gb /path/to/core-qa.gbc`
-to exercise both cores in one process. Only the first ROM and the test
-directory are required. The test directory must exist. Tests run against
-Q2 firmware libraries in a MIPS emulator. Use the physical Q2 for playback,
-screen, and input checks.
+GB and GBC test ROMs. Run `python3 tests/make-home-fixtures.py /path/to/fixtures`
+for original NES and SNES test ROMs. Pass all of them to the Q2 binary to
+exercise all four cores in one process.
+
+```sh
+q2-boy --smoke test.gba /path/to/existing-test-directory \
+  core-qa.gb core-qa.gbc core-qa.nes core-qa.sfc core-qa.smc
+```
+
+Tests run against Q2 firmware libraries in a MIPS emulator. Use the physical
+Q2 for playback, display, and input checks.

@@ -297,10 +297,11 @@ static bool read_cover(const char *path, Cover *cover, bool is_png) {
 }
 
 static void cartridge_icon(Cover *cover, enum CartridgeSystem system) {
-    const uint32_t shells[] = {0xffb2b4a6, 0xff886bb0, 0xff626f8e};
-    const uint32_t labels[] = {0xff737d60, 0xffb65981, 0xff387d97};
-    cover->width = system == SYSTEM_GBA ? 150 : 116;
-    cover->height = system == SYSTEM_GBA ? 104 : 136;
+    const uint32_t shells[] = {0xffb2b4a6, 0xff886bb0, 0xff626f8e, 0xffa6a7a8, 0xffa4a3ad};
+    const uint32_t labels[] = {0xff737d60, 0xffb65981, 0xff387d97, 0xffae5443, 0xff665099};
+    bool wide = system == SYSTEM_GBA || system == SYSTEM_SNES;
+    cover->width = wide ? 150 : 116;
+    cover->height = wide ? 104 : 136;
     unsigned w = cover->width, h = cover->height;
     for (unsigned y = 0; y < h; ++y) {
         for (unsigned x = 0; x < w; ++x) {
@@ -323,7 +324,19 @@ void cover_clear(void) {
     age = 0;
 }
 
-static const Cover *find_cover(const char *directory, const char *name, enum CartridgeSystem system) {
+static bool artwork_in(const char *directory, const char *name, Cover *cover) {
+    static const char *const extensions[] = {".png", ".PNG", ".jpg", ".JPG", ".jpeg", ".JPEG"};
+    char path[1024];
+    int stem = (int)(strrchr(name, '.') - name);
+    for (unsigned i = 0; i < sizeof extensions / sizeof extensions[0]; ++i) {
+        int length = snprintf(path, sizeof path, "%s/%.*s%s", directory, stem, name, extensions[i]);
+        if (length > 0 && (size_t)length < sizeof path && read_cover(path, cover, i < 2)) return true;
+    }
+    return false;
+}
+
+static const Cover *find_cover(const char *directory, const char *fallback, const char *name,
+                               enum CartridgeSystem system) {
     Cover *oldest = covers;
     for (unsigned i = 0; i < CACHE_COUNT; ++i) {
         Cover *cover = &covers[i];
@@ -336,14 +349,8 @@ static const Cover *find_cover(const char *directory, const char *name, enum Car
     snprintf(oldest->name, sizeof oldest->name, "%s", name);
     oldest->age = ++age;
 
-    static const char *const extensions[] = {".png", ".PNG", ".jpg", ".JPG", ".jpeg", ".JPEG"};
-    char path[1024];
-    int stem = (int)(strrchr(name, '.') - name);
-    for (unsigned i = 0; i < sizeof extensions / sizeof extensions[0]; ++i) {
-        int length = snprintf(path, sizeof path, "%s/%.*s%s", directory, stem, name, extensions[i]);
-        if (length > 0 && (size_t)length < sizeof path && read_cover(path, oldest, i < 2)) return oldest;
-    }
-    cartridge_icon(oldest, system);
+    if (!artwork_in(directory, name, oldest) && (!fallback || !artwork_in(fallback, name, oldest)))
+        cartridge_icon(oldest, system);
     return oldest;
 }
 
@@ -396,20 +403,21 @@ static bool cover_column(const Cover *cover, CoverPose pose, int x,
     return *height > 0;
 }
 
-bool cover_hit(const char *directory, const char *name, enum CartridgeSystem system,
+bool cover_hit(const char *directory, const char *fallback, const char *name,
+               enum CartridgeSystem system,
                float distance, int x, int y) {
     if (fabsf(distance) >= COVER_REACH) return false;
-    const Cover *cover = find_cover(directory, name, system);
+    const Cover *cover = find_cover(directory, fallback, name, system);
     unsigned source;
     int top, height;
     return cover_column(cover, cover_pose(distance), x, &source, &top, &height) &&
            y >= top && y < top + height;
 }
 
-void cover_draw(uint32_t *canvas, const char *directory, const char *name,
+void cover_draw(uint32_t *canvas, const char *directory, const char *fallback, const char *name,
                 enum CartridgeSystem system, float distance, int offset_y) {
     if (fabsf(distance) >= COVER_REACH) return;
-    const Cover *cover = find_cover(directory, name, system);
+    const Cover *cover = find_cover(directory, fallback, name, system);
     CoverPose pose = cover_pose(distance);
     float half = cover->width * 0.5f;
     float left = CAMERA_DEPTH * (pose.x - half * pose.cosine) / (pose.depth + half * pose.sine);
