@@ -74,6 +74,19 @@ Last played tracks successful launches and lists unplayed games alphabetically
 at the end. The same menu offers **List view** and **Refresh ROMs and covers**.
 Pocket Boy remembers the sort and view on the SD card.
 
+## Picture scaling
+
+Open **Menu → Display and controls** while playing. **Picture** cycles through
+**Original aspect**, **Crop to fill**, **Stretch to fill**, and **Integer Scale**.
+Integer Scale uses the largest whole-number fit with square pixels: 2× for
+GB and GBC, and 1× for GBA, NES, and typical SNES games. Higher-resolution
+SNES modes that exceed the screen fall back to Original aspect.
+
+**Filter** switches between **Sharp Bilinear** (the default) and **Nearest**.
+Sharp Bilinear smooths fractional pixel edges while preserving the larger
+picture. Try **Original aspect** with **Sharp Bilinear** for GBA. Integer
+multiples stay sharp with either filter.
+
 ## Controls
 
 By default, the Q2's Return, Play/Pause, Previous, and Next buttons act as

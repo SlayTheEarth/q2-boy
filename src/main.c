@@ -34,7 +34,8 @@
 #define DARK RGB(0x0c161a)
 
 enum Screen { BROWSER, GAME, MENU, STATES, SETTINGS, EDIT, CONFIRM, AUDIO, PHYSICAL, TOUCH, ASSIGN, BROWSER_OPTIONS };
-enum Scale { FIT, CROP, STRETCH };
+enum Scale { FIT, CROP, STRETCH, INTEGER_SCALE, SCALE_COUNT };
+enum VideoFilter { NEAREST, SHARP_BILINEAR };
 enum Control { L, R, B, MENU_BUTTON, SPEED, QUICK_SAVE, QUICK_LOAD, AB, SELECT_BUTTON, START_BUTTON, TOUCH_A, TOUCH_UP, TOUCH_DOWN, TOUCH_LEFT, TOUCH_RIGHT, TOUCH_X, TOUCH_Y, CONTROLS };
 enum Action { SAVE = 1, LOAD };
 typedef struct { int x, y, size, opacity, visible; unsigned keys; const char *label; } Button;
@@ -125,6 +126,7 @@ static double measured_speed;
 static Button buttons[CONTROLS];
 static enum Screen screen = BROWSER, confirm_from;
 static enum Scale scaling;
+static enum VideoFilter video_filter = SHARP_BILINEAR;
 static int running, fast, dirty = 1, slot, edit_button, dragging = -1;
 static int drag_x, drag_y, edit_start_x, edit_start_y, edit_moved, touch_button = -1, wheel_delta, menu_focus;
 
@@ -345,28 +347,112 @@ static bool overlay_visible(int index) {
     return active_system != SYSTEM_NES || !(button->keys & (KEY(L) | KEY(R)));
 }
 
-static void draw_game(void) {
-    int w = WIDTH, h = HEIGHT, base_x = 0, base_y = 0;
+typedef struct { int x, y, width, height; } Picture;
+
+static Picture game_picture(void) {
+    int width = WIDTH, height = HEIGHT;
+    if (scaling == INTEGER_SCALE) {
+        unsigned scale_x = WIDTH / cart_width, scale_y = HEIGHT / cart_height;
+        unsigned scale = scale_x < scale_y ? scale_x : scale_y;
+        if (scale) {
+            width = scale * cart_width;
+            height = scale * cart_height;
+            return (Picture){(WIDTH - width) / 2, (HEIGHT - height) / 2, width, height};
+        }
+    }
     /* TV consoles use the 4:3 display shape. Preserve handheld pixel geometry. */
     unsigned aspect_w = active_system >= SYSTEM_NES ? 4 : cart_width;
     unsigned aspect_h = active_system >= SYSTEM_NES ? 3 : cart_height;
     bool panel_is_narrower = WIDTH * aspect_h <= HEIGHT * aspect_w;
     if (scaling != STRETCH) {
-        if (panel_is_narrower == (scaling == FIT)) h = WIDTH * aspect_h / aspect_w;
-        else w = HEIGHT * aspect_w / aspect_h;
-        base_x = (WIDTH - w) / 2;
-        base_y = (HEIGHT - h) / 2;
+        if (panel_is_narrower == (scaling != CROP)) height = WIDTH * aspect_h / aspect_w;
+        else width = HEIGHT * aspect_w / aspect_h;
     }
-    int left = base_x < 0 ? 0 : base_x;
-    int right = clamp(base_x + w, 0, WIDTH);
+    return (Picture){(WIDTH - width) / 2, (HEIGHT - height) / 2, width, height};
+}
+
+static void draw_nearest(Picture p) {
+    int left = clamp(p.x, 0, WIDTH), right = clamp(p.x + p.width, 0, WIDTH);
     int lookup[WIDTH];
-    for (int x = left; x < right; ++x) lookup[x] = (x - base_x) * cart_width / w;
-    memset(canvas, 0, sizeof canvas);
-    for (int y = clamp(base_y, 0, HEIGHT); y < clamp(base_y + h, 0, HEIGHT); ++y) {
-        const uint32_t *source = cart + ((y - base_y) * cart_height / h) * cart_width;
+    for (int x = left; x < right; ++x) lookup[x] = (x - p.x) * cart_width / p.width;
+    for (int y = clamp(p.y, 0, HEIGHT); y < clamp(p.y + p.height, 0, HEIGHT); ++y) {
+        const uint32_t *source = cart + ((y - p.y) * cart_height / p.height) * cart_width;
         uint32_t *dest = canvas + y * WIDTH;
         for (int x = left; x < right; ++x) dest[x] = source[lookup[x]];
     }
+}
+
+typedef struct { uint16_t pixel, weight; } VideoSample;
+
+static void sharp_axis(VideoSample *samples, int start, int end, int origin, int output, int input) {
+    for (int i = start; i < end; ++i) {
+        int offset = i - origin;
+        if (output >= input) {
+            /* Blend only where a destination pixel straddles a source pixel edge. */
+            int edge = offset * input;
+            int overlap = edge % output + input - output;
+            samples[i] = (VideoSample){edge / output, overlap > 0 ? overlap * 256 / input : 0};
+        } else {
+            /* Use a centered bilinear sample when a high-resolution frame needs shrinking. */
+            int center = (2 * offset + 1) * input - output;
+            int step = 2 * output;
+            samples[i] = (VideoSample){center / step, (center % step) * 256 / step};
+        }
+    }
+}
+
+static inline uint32_t blend_video(uint32_t a, uint32_t b, unsigned weight) {
+    const uint32_t red_blue = 0x00ff00ffu, green = 0x0000ff00u;
+    unsigned rest = 256 - weight;
+    uint32_t rb = ((a & red_blue) * rest + (b & red_blue) * weight) >> 8;
+    uint32_t g = ((a & green) * rest + (b & green) * weight) >> 8;
+    return RGB((rb & red_blue) | (g & green));
+}
+
+static inline uint32_t sample_column(const uint32_t *row, VideoSample sample) {
+    uint32_t pixel = row[sample.pixel];
+    return sample.weight ? blend_video(pixel, row[sample.pixel + 1], sample.weight) : pixel;
+}
+
+static const uint32_t *sharp_row(uint32_t cache[2][WIDTH], int cached[2],
+                                 const VideoSample columns[WIDTH], int row, int left, int right) {
+    unsigned slot = row % 2;
+    if (cached[slot] != row) {
+        const uint32_t *source = cart + row * cart_width;
+        for (int x = left; x < right; ++x) cache[slot][x] = sample_column(source, columns[x]);
+        cached[slot] = row;
+    }
+    return cache[slot];
+}
+
+static void draw_sharp(Picture p) {
+    VideoSample columns[WIDTH], rows[HEIGHT];
+    uint32_t row_cache[2][WIDTH];
+    int cached[2] = {-1, -1};
+    int left = clamp(p.x, 0, WIDTH), right = clamp(p.x + p.width, 0, WIDTH);
+    int top = clamp(p.y, 0, HEIGHT), bottom = clamp(p.y + p.height, 0, HEIGHT);
+    sharp_axis(columns, left, right, p.x, p.width, cart_width);
+    sharp_axis(rows, top, bottom, p.y, p.height, cart_height);
+    for (int y = top; y < bottom; ++y) {
+        int source_y = rows[y].pixel;
+        const uint32_t *row = sharp_row(row_cache, cached, columns, source_y, left, right);
+        uint32_t *dest = canvas + y * WIDTH;
+        if (rows[y].weight) {
+            const uint32_t *next = sharp_row(row_cache, cached, columns, source_y + 1, left, right);
+            for (int x = left; x < right; ++x)
+                dest[x] = blend_video(row[x], next[x], rows[y].weight);
+        } else {
+            memcpy(dest + left, row + left, (right - left) * sizeof(*dest));
+        }
+    }
+}
+
+static void draw_game(void) {
+    Picture picture = game_picture();
+    memset(canvas, 0, sizeof canvas);
+    if (video_filter == SHARP_BILINEAR &&
+        (picture.width % cart_width || picture.height % cart_height)) draw_sharp(picture);
+    else draw_nearest(picture);
     for (int i = 0; i < CONTROLS; ++i) {
         if (!overlay_visible(i)) continue;
         char label[12];
@@ -486,7 +572,8 @@ static int write_overlay(char *buffer, size_t remaining, const Button *b) {
 
 static void store_config(void) {
     char buffer[768];
-    int used = snprintf(buffer, sizeof buffer, "%d 9 %d %d\n", scaling, fast_rate, local_volume);
+    int used = snprintf(buffer, sizeof buffer, "%d 9 %d %d %d\n",
+                        scaling, fast_rate, local_volume, video_filter);
     for (int i = 0; i < TOUCH_X; ++i)
         used += write_overlay(buffer + used, sizeof buffer - used, &buttons[i]);
     for (int i = 0; i < PHYSICAL_COUNT; ++i)
@@ -537,13 +624,15 @@ static void load_config(void) {
     memcpy(buttons, defaults, sizeof buttons);
     memcpy(physical_map, physical_defaults, sizeof physical_map);
     FILE *f = fopen(config_file, "r");
-    int saved_scale = FIT, version = 1, rate = 2, volume = 100;
+    int saved_scale = FIT, version = 1, rate = 2, volume = 100, saved_filter = SHARP_BILINEAR;
     char line[80];
     if (!f) return;
-    if (fgets(line, sizeof line, f)) sscanf(line, "%d %d %d %d", &saved_scale, &version, &rate, &volume);
+    if (fgets(line, sizeof line, f))
+        sscanf(line, "%d %d %d %d %d", &saved_scale, &version, &rate, &volume, &saved_filter);
     local_volume = clamp(volume, 0, 100);
     platform_audio_attenuation(local_volume);
-    if (saved_scale >= FIT && saved_scale <= STRETCH) scaling = saved_scale;
+    if (saved_scale >= FIT && saved_scale < SCALE_COUNT) scaling = saved_scale;
+    video_filter = saved_filter == NEAREST ? NEAREST : SHARP_BILINEAR;
     if (rate == 2 || rate == 3 || rate == 5) fast_rate = rate == 5 ? 3 : rate;
     int rows = version < 3 ? (int)(sizeof previous_overlays / sizeof previous_overlays[0]) :
                version < 6 ? TOUCH_A : TOUCH_X;
@@ -974,14 +1063,17 @@ static int menu_items(MenuItem *items) {
         ITEM(15, 235, 345, 51, "Back", true);
         break;
     case SETTINGS: {
-        static const char *const modes[] = {"Original aspect", "Crop to fill", "Stretch to fill"};
+        static const char *const modes[SCALE_COUNT] = {
+            "Original aspect", "Crop to fill", "Stretch to fill", "Integer Scale"
+        };
         snprintf(label, sizeof label, "Picture: %s", modes[scaling]);
-        ITEM(15, 53, 345, 43, label, true);
-        ITEM(15, 103, 345, 43, "Physical buttons", true);
-        ITEM(15, 153, 345, 43, "Touch buttons", true);
-        ITEM(15, 203, 345, 44, "Move, resize, or fade buttons", true);
-        ITEM(15, 258, 132, 48, "Back", true);
-        ITEM(152, 258, 208, 48, "Reset controls", true);
+        ITEM(15, 50, 345, 40, label, true);
+        ITEM(15, 93, 345, 40, video_filter == SHARP_BILINEAR ? "Filter: Sharp Bilinear" : "Filter: Nearest", true);
+        ITEM(15, 136, 345, 40, "Physical buttons", true);
+        ITEM(15, 179, 345, 40, "Touch buttons", true);
+        ITEM(15, 222, 345, 40, "Move, resize, or fade buttons", true);
+        ITEM(15, 267, 132, 40, "Back", true);
+        ITEM(152, 267, 208, 40, "Reset controls", true);
         break;
     }
     case PHYSICAL:
@@ -1384,11 +1476,14 @@ static void activate_menu(int index) {
         else go_back();
         break;
     case SETTINGS:
-        if (index == 0) { scaling = (scaling + 1) % 3; store_config(); }
-        else if (index == 1) set_screen(PHYSICAL);
-        else if (index == 2) { touch_page = 0; set_screen(TOUCH); }
-        else if (index == 3) { edit_button = MENU_BUTTON; set_screen(EDIT); }
-        else if (index == 4) go_back();
+        if (index == 0) { scaling = (scaling + 1) % SCALE_COUNT; store_config(); }
+        else if (index == 1) {
+            video_filter = video_filter == SHARP_BILINEAR ? NEAREST : SHARP_BILINEAR;
+            store_config();
+        } else if (index == 2) set_screen(PHYSICAL);
+        else if (index == 3) { touch_page = 0; set_screen(TOUCH); }
+        else if (index == 4) { edit_button = MENU_BUTTON; set_screen(EDIT); }
+        else if (index == 5) go_back();
         else {
             memcpy(buttons, defaults, sizeof buttons);
             memcpy(physical_map, physical_defaults, sizeof physical_map);
@@ -1811,7 +1906,17 @@ static int smoke_test(const char *path) {
         read_touch('u', x, y);
         pressed_this_frame = 0;
     }
-    for (int i = FIT; i <= STRETCH; ++i) { scaling = i; draw_ui(); }
+    enum Scale initial_scale = scaling;
+    enum VideoFilter initial_filter = video_filter;
+    for (int i = FIT; i < SCALE_COUNT; ++i) {
+        scaling = i;
+        video_filter = NEAREST;
+        draw_ui();
+        video_filter = SHARP_BILINEAR;
+        draw_ui();
+    }
+    scaling = initial_scale;
+    video_filter = initial_filter;
     set_screen(MENU);
     read_wheel(-21);
     read_event((Event){'g', 'd', 116, 0});
@@ -1876,7 +1981,18 @@ static int smoke_test(const char *path) {
     if (screen != GAME || physical_keys || pressed_this_frame) { close_rom(); return 24; }
     read_event((Event){'g', 'u', 116, 0});
     set_screen(SETTINGS);
-    activate_menu(5); /* Reset controls. */
+    scaling = STRETCH;
+    video_filter = SHARP_BILINEAR;
+    read_touch('d', 100, 70);
+    read_touch('d', 100, 113);
+    if (scaling != INTEGER_SCALE || video_filter != NEAREST) { close_rom(); return 30; }
+    scaling = FIT;
+    video_filter = SHARP_BILINEAR;
+    load_config();
+    if (scaling != INTEGER_SCALE || video_filter != NEAREST) { close_rom(); return 31; }
+    scaling = initial_scale;
+    video_filter = initial_filter;
+    activate_menu(6); /* Reset controls. */
     if (physical_map[P_CENTRE] != KEY(A) || buttons[TOUCH_A].visible ||
         !buttons[B].visible) { close_rom(); return 25; }
     for (int i = 0; i < CONTROLS; ++i)
@@ -1965,7 +2081,7 @@ static void log_launch(void) {
     sigaction(SIGSEGV, &action, NULL);
     sigaction(SIGABRT, &action, NULL);
     sigaction(SIGFPE, &action, NULL);
-    fprintf(stderr, "\nq2-boy 0.3.2, engine=%s\n",
+    fprintf(stderr, "\nq2-boy 0.3.3, engine=%s\n",
             use_dynarec ? "dynamic recompiler (opt-in)" : "interpreter");
     FILE *memory = fopen("/proc/meminfo", "r");
     if (memory) {
