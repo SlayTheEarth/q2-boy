@@ -5,6 +5,7 @@
 #include <fcntl.h>
 #include <linux/fb.h>
 #include <linux/input.h>
+#include <poll.h>
 #include <pthread.h>
 #include <signal.h>
 #include <stdio.h>
@@ -19,12 +20,20 @@
 
 #define INPUT_SOCKET "/tmp/q2-boy.input.sock"
 static int fb = -1, keys = -1, sock = -1, back, stride, original_y;
+static int stop_pipe[2] = {-1, -1};
+static volatile sig_atomic_t signal_writer = -1;
 static struct fb_var_screeninfo video;
 static size_t map_size;
 static uint32_t *map;
 static snd_pcm_t *pcm;
 static int jack, soft_volume = 100, attenuation = 100;
 static unsigned sample_rate = 65536;
+#define PCM_QUEUE 4096
+static int16_t audio_queue[PCM_QUEUE][2];
+static unsigned audio_head, audio_count;
+static int diagnostics;
+/* Only the flip fields are written by the display worker. */
+static PlatformStats stats;
 volatile sig_atomic_t quitting;
 int raw_buttons;
 
@@ -33,7 +42,13 @@ uint64_t clock_ns(void) {
     clock_gettime(CLOCK_MONOTONIC, &now);
     return (uint64_t)now.tv_sec * 1000000000u + now.tv_nsec;
 }
-static void request_quit(int sig) { (void)sig; quitting = 1; }
+static void request_quit(int sig) {
+    (void)sig;
+    int saved_errno = errno;
+    quitting = 1;
+    if (signal_writer >= 0) (void)write(signal_writer, "q", 1);
+    errno = saved_errno;
+}
 
 static void grab_buttons(void) {
     for (int i = 0; i < 32; ++i) {
@@ -93,6 +108,8 @@ static void open_audio(const char *device, const char *volume) {
     fprintf(stderr, "ALSA open failed for %s\n", device);
 }
 int platform_open(const char *device, const char *volume, int music) {
+    if (pipe2(stop_pipe, O_NONBLOCK | O_CLOEXEC)) return 0;
+    signal_writer = stop_pipe[1];
     signal(SIGTERM, request_quit);
     signal(SIGINT, request_quit);
     struct fb_fix_screeninfo fixed;
@@ -142,42 +159,76 @@ int platform_event(Event *e) {
         e->kind = buffer[0];
     return 1;
 }
+void platform_wait(uint64_t deadline) {
+    if (quitting) return;
+    struct pollfd input[] = {{keys, POLLIN, 0}, {sock, POLLIN, 0}, {stop_pipe[0], POLLIN, 0}};
+    struct timespec timeout, *limit = NULL;
+    if (deadline != UINT64_MAX) {
+        uint64_t now = clock_ns();
+        if (now >= deadline) return;
+        uint64_t delay = deadline - now;
+        timeout = (struct timespec){delay / 1000000000ull, delay % 1000000000ull};
+        limit = &timeout;
+    }
+    (void)ppoll(input, sizeof input / sizeof input[0], limit, NULL);
+}
+
+static void rotate_frame(uint32_t *page, int pitch, const uint32_t *pixels) {
+    const int tile = 8;
+    for (int left = 0; left < WIDTH; left += tile) {
+        int right = left + tile < WIDTH ? left + tile : WIDTH;
+        for (int top = 0; top < HEIGHT; top += tile) {
+            for (int x = left; x < right; ++x) {
+                uint32_t *dest = page + x * pitch + HEIGHT - 1 - top;
+                const uint32_t *src = pixels + top * WIDTH + x;
+                for (int y = 0; y < tile && top + y < HEIGHT; ++y) dest[-y] = src[y * WIDTH];
+            }
+        }
+    }
+}
 static void display_frame(const uint32_t *pixels) {
     uint32_t *page = map + back * stride;
-    for (int x = 0; x < WIDTH; ++x)
-        for (int y = 0; y < HEIGHT; ++y)
-            page[x * stride + HEIGHT - 1 - y] = pixels[y * WIDTH + x];
+    rotate_frame(page, stride, pixels);
     video.yoffset = back;
-    if (!ioctl(fb, FBIOPAN_DISPLAY, &video)) back = back ? 0 : WIDTH;
+    uint64_t before = diagnostics ? clock_ns() : 0;
+    int result = ioctl(fb, FBIOPAN_DISPLAY, &video);
+    if (!result) back = back ? 0 : WIDTH;
+    if (diagnostics) {
+        if (!result) __atomic_add_fetch(&stats.flips, 1, __ATOMIC_RELAXED);
+        unsigned elapsed = (clock_ns() - before) / 1000;
+        unsigned old = __atomic_load_n(&stats.longest_flip_us, __ATOMIC_RELAXED);
+        while (elapsed > old && !__atomic_compare_exchange_n(&stats.longest_flip_us, &old, elapsed,
+               0, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {}
+    }
 }
 /* The panel's page flip can block on scanout. Higher fast-forward targets
  * use a newest-frame mailbox so the emulation thread can keep going. */
 static pthread_t display_thread;
 static pthread_mutex_t display_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t display_ready = PTHREAD_COND_INITIALIZER;
-static uint32_t display_buffers[2][WIDTH * HEIGHT];
-static int fill_buffer, display_started, display_stop, display_pending, display_busy;
+static uint32_t display_buffers[3][WIDTH * HEIGHT];
+static int draw_buffer, queued = -1, displaying = -1, display_started, display_stop;
+uint32_t *platform_canvas(void) { return display_buffers[draw_buffer]; }
 
 static void *display_loop(void *unused) {
     (void)unused;
     pthread_mutex_lock(&display_lock);
     while (!display_stop) {
-        while (!display_pending && !display_stop) pthread_cond_wait(&display_ready, &display_lock);
+        while (queued < 0 && !display_stop) pthread_cond_wait(&display_ready, &display_lock);
         if (display_stop) break;
-        const uint32_t *frame = display_buffers[fill_buffer];
-        fill_buffer ^= 1;
-        display_pending = 0;
-        display_busy = 1;
+        displaying = queued;
+        queued = -1;
+        const uint32_t *frame = display_buffers[displaying];
         pthread_mutex_unlock(&display_lock);
         display_frame(frame);
         pthread_mutex_lock(&display_lock);
-        display_busy = 0;
+        displaying = -1;
         pthread_cond_broadcast(&display_ready);
     }
     pthread_mutex_unlock(&display_lock);
     return NULL;
 }
-void platform_present(const uint32_t *pixels, int asynchronous) {
+void platform_present(int asynchronous) {
     if (asynchronous && !display_started && !display_stop) {
         if (!pthread_create(&display_thread, NULL, display_loop, NULL)) display_started = 1;
         else {
@@ -188,17 +239,21 @@ void platform_present(const uint32_t *pixels, int asynchronous) {
     if (display_started) {
         pthread_mutex_lock(&display_lock);
         if (asynchronous) {
-            memcpy(display_buffers[fill_buffer], pixels, sizeof display_buffers[0]);
-            display_pending = 1;
+            int spare = queued;
+            if (spare < 0) {
+                for (spare = 0; spare == draw_buffer || spare == displaying; ++spare) {}
+            } else if (diagnostics) ++stats.dropped_frames;
+            queued = draw_buffer;
+            draw_buffer = spare;
             pthread_cond_signal(&display_ready);
             pthread_mutex_unlock(&display_lock);
             return;
         }
-        display_pending = 0;
-        while (display_busy) pthread_cond_wait(&display_ready, &display_lock);
+        queued = -1;
+        while (displaying >= 0) pthread_cond_wait(&display_ready, &display_lock);
         pthread_mutex_unlock(&display_lock);
     }
-    display_frame(pixels);
+    display_frame(platform_canvas());
 }
 static void stop_display(void) {
     if (!display_started) return;
@@ -211,8 +266,8 @@ static void stop_display(void) {
 void platform_yield_to_player(void) {
     if (display_started) {
         pthread_mutex_lock(&display_lock);
-        display_pending = 0;
-        while (display_busy) pthread_cond_wait(&display_ready, &display_lock);
+        queued = -1;
+        while (displaying >= 0) pthread_cond_wait(&display_ready, &display_lock);
         pthread_mutex_unlock(&display_lock);
     }
     if (keys >= 0) close(keys);
@@ -224,6 +279,7 @@ void platform_resume_from_player(void) {
     if (keys < 0) grab_buttons();
 }
 void platform_audio_release(void) {
+    audio_head = audio_count = 0;
     if (!pcm) return;
     snd_pcm_drop(pcm);
     snd_pcm_close(pcm);
@@ -245,6 +301,7 @@ void platform_audio_attenuation(int percent) {
 void platform_audio_set_rate(unsigned rate) {
     if (sample_rate == rate) return;
     sample_rate = rate;
+    audio_head = audio_count = 0;
     if (pcm) {
         snd_pcm_drop(pcm);
         if (snd_pcm_set_params(pcm, SND_PCM_FORMAT_S16_LE, SND_PCM_ACCESS_RW_INTERLEAVED,
@@ -255,35 +312,81 @@ void platform_audio_set_rate(unsigned rate) {
     }
 }
 void platform_audio_reset(void) {
+    audio_head = audio_count = 0;
     if (pcm) { snd_pcm_drop(pcm); snd_pcm_prepare(pcm); }
+}
+int platform_audio_pending(void) { return pcm && audio_count; }
+void platform_audio_service(void) {
+    while (pcm && audio_count) {
+        unsigned span = PCM_QUEUE - audio_head;
+        unsigned count = audio_count < span ? audio_count : span;
+        snd_pcm_sframes_t written = snd_pcm_writei(pcm, audio_queue[audio_head], count);
+        if (written == -EPIPE || written == -ESTRPIPE) {
+            if (diagnostics) ++stats.underruns;
+            written = snd_pcm_recover(pcm, written, 1);
+            if (!written) written = snd_pcm_writei(pcm, audio_queue[audio_head], count);
+        }
+        if (!written || written == -EAGAIN || written == -EINTR) return;
+        if (written < 0) {
+            if (diagnostics) stats.dropped_samples += audio_count;
+            audio_head = audio_count = 0;
+            return;
+        }
+        audio_head = (audio_head + written) % PCM_QUEUE;
+        audio_count -= written;
+    }
 }
 void platform_audio_write(const int16_t *samples, unsigned frames, int muted) {
     if (!pcm || muted) return;
-    int volume = soft_volume * attenuation / 100;
-    int16_t adjusted[1024 * 2];
-    while (frames) {
-        unsigned count = frames > 1024 ? 1024 : frames;
-        const int16_t *data = samples;
-        if (volume != 100) {
-            for (unsigned i = 0; i < count * 2; ++i)
-                adjusted[i] = samples[i] * volume / 100;
-            data = adjusted;
-        }
-        snd_pcm_sframes_t written = snd_pcm_writei(pcm, data, count);
-        if (written == -EPIPE || written == -ESTRPIPE) {
-            if (snd_pcm_recover(pcm, written, 1) < 0) return;
-            written = snd_pcm_writei(pcm, data, count);
-        }
-        if (written <= 0) return;
-        samples += written * 2;
-        frames -= written;
+    platform_audio_service();
+    if (frames > PCM_QUEUE - audio_count) {
+        unsigned trim = frames - (PCM_QUEUE - audio_count);
+        unsigned queued_trim = trim < audio_count ? trim : audio_count;
+        audio_head = (audio_head + queued_trim) % PCM_QUEUE;
+        audio_count -= queued_trim;
+        samples += (trim - queued_trim) * 2;
+        frames -= trim - queued_trim;
+        if (diagnostics) stats.dropped_samples += trim;
     }
+    const int volume = soft_volume * attenuation / 100;
+    unsigned tail = (audio_head + audio_count) % PCM_QUEUE;
+    while (frames) {
+        unsigned count = PCM_QUEUE - tail < frames ? PCM_QUEUE - tail : frames;
+        if (volume == 100) memcpy(audio_queue[tail], samples, count * sizeof audio_queue[0]);
+        else {
+            for (unsigned i = 0; i < count; ++i) {
+                audio_queue[tail + i][0] = samples[2 * i] * volume / 100;
+                audio_queue[tail + i][1] = samples[2 * i + 1] * volume / 100;
+            }
+        }
+        samples += 2 * count;
+        audio_count += count;
+        frames -= count;
+        tail = 0;
+    }
+    platform_audio_service();
+}
+void platform_set_diagnostics(int enabled) { diagnostics = enabled; }
+PlatformStats platform_take_stats(void) {
+    PlatformStats result = {
+        __atomic_exchange_n(&stats.flips, 0, __ATOMIC_RELAXED),
+        stats.dropped_frames,
+        __atomic_exchange_n(&stats.longest_flip_us, 0, __ATOMIC_RELAXED),
+        stats.underruns, stats.dropped_samples
+    };
+    stats.dropped_frames = stats.underruns = stats.dropped_samples = 0;
+    return result;
 }
 void platform_close(void) {
     stop_display();
     if (keys >= 0) close(keys);
     platform_audio_release();
     if (sock >= 0) { close(sock); unlink(INPUT_SOCKET); }
+    if (stop_pipe[1] >= 0) {
+        signal_writer = -1;
+        close(stop_pipe[1]);
+        close(stop_pipe[0]);
+    }
     if (map) {
         video.yoffset = original_y;
         ioctl(fb, FBIOPAN_DISPLAY, &video);

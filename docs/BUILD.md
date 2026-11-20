@@ -30,13 +30,16 @@ GPSP="$PWD/deps/gpsp" sh src/build.sh dist/.boy/q2-boy
 
 git clone https://github.com/libretro/gambatte.git deps/gambatte
 git -C deps/gambatte checkout 77f2567d718b8973d02caa2daa8dce4953faf811
+git -C deps/gambatte apply "$PWD/patches/gambatte-q2.patch"
 export CXX_HEADERS=/absolute/path/to/extracted/headers
 GAMBATTE="$PWD/deps/gambatte" sh src/build-gambatte.sh dist/.boy/gambatte_libretro.so
 
 git clone https://github.com/libretro/libretro-fceumm.git deps/fceumm
 git -C deps/fceumm checkout 77468e568d9fe9c48d684ca911f1a3fe7259fdf7
+git -C deps/fceumm apply "$PWD/patches/fceumm-q2.patch"
 git clone https://github.com/libretro/snes9x2005.git deps/snes9x2005
 git -C deps/snes9x2005 checkout a79dfe9047e7fec58808aefe48ad2bf499c7af11
+git -C deps/snes9x2005 apply "$PWD/patches/snes9x2005-q2.patch"
 FCEUMM="$PWD/deps/fceumm" SNES9X2005="$PWD/deps/snes9x2005" \
   sh src/build-home-cores.sh dist/.boy
 ```
@@ -53,6 +56,11 @@ It targets commit `633f7b9e8df4d1278f39fd14d31e01cb51b9623e`.
 Apply the patch at the Q2-Pod checkout root and follow its development build
 instructions with the pinned Shanling Q2 V1.36 ZIP. The proposed upstream
 change is tracked in [PR #426](https://github.com/DiamondBond/q2-pod/pull/426).
+
+To build with idle dimming, apply [the display patch](../firmware/q2-pod-boy-display.patch)
+after the audio patch. The display bridge dims after 30 seconds on a library or
+menu screen. The firmware restores its configured brightness on wake, native
+Now Playing, and child exit, including a crash.
 
 ## Smoke test
 

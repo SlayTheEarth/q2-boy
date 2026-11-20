@@ -1,0 +1,48 @@
+diff --git a/src/drivers/libretro/libretro.c b/src/drivers/libretro/libretro.c
+index e9f5247..ea5d004 100644
+--- a/src/drivers/libretro/libretro.c
++++ b/src/drivers/libretro/libretro.c
+@@ -3496,6 +3496,11 @@ void retro_run(void)
+    uint8_t *gfx;
+    int32_t ssize = 0;
+    bool updated  = false;
++#ifdef Q2_FRAME_BUDGET
++   int enabled = 3;
++   if (!environ_cb(RETRO_ENVIRONMENT_GET_AUDIO_VIDEO_ENABLE, &enabled))
++      enabled = 3;
++#endif
+ 
+    if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE_UPDATE, &updated) && updated)
+       check_variables(false);
+@@ -3508,7 +3513,19 @@ void retro_run(void)
+       HDNes_FrameEnd();
+ #endif
+ 
++#ifdef Q2_FRAME_BUDGET
++   /* Advance the PPU above and bypass the Q2 software pixel conversion. */
++   if (enabled & 1)
++      retro_run_blit(gfx);
++   else
++   {
++      unsigned width = 256 - crop_overscan_h_left - crop_overscan_h_right;
++      unsigned height = 240 - crop_overscan_v_top - crop_overscan_v_bottom;
++      video_cb(NULL, width, height, width * sizeof(bpp_t));
++   }
++#else
+    retro_run_blit(gfx);
++#endif
+ 
+    stereo_filter_apply(sound, ssize);
+ #ifdef HAVE_HDPACK
+@@ -3518,7 +3535,10 @@ void retro_run(void)
+       HDNes_MixAudio(sound, (size_t)ssize, sndsamplerate);
+    }
+ #endif
+-   audio_batch_cb((const int16_t*)sound, ssize);
++#ifdef Q2_FRAME_BUDGET
++   if (enabled & 2)
++#endif
++      audio_batch_cb((const int16_t*)sound, ssize);
+ }
+ 
+ size_t retro_serialize_size(void)

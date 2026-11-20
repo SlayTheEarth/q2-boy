@@ -27,6 +27,9 @@
 #define SLOTS 10
 #define ROWS 5
 #define ROM_LIMIT 200
+#define DISPLAY_REQUEST "/tmp/q2-boy.display.req"
+#define DISPLAY_DIMMED "/tmp/q2-boy.display.dimmed"
+#define DISPLAY_IDLE_NS 30000000000ull
 #define KEY(id) (1u << RETRO_DEVICE_ID_JOYPAD_##id)
 #define RGB(value) (0xff000000u | (value))
 #define ACCENT RGB(0x87e4c7)
@@ -124,6 +127,13 @@ static int local_volume = 100, audio_route;
 static uint32_t audio_seq;
 static enum AudioAction pending_action;
 static uint64_t audio_polled, audio_request_time;
+static bool performance_log;
+static bool smoke_mute;
+static bool display_bridge, dimmed;
+static uint64_t last_activity;
+static int wake_key = -1;
+static bool wake_touch;
+static unsigned longest_run_us, longest_draw_us, late_frames;
 static bool core_options_changed, allow_video = true;
 static uint64_t next_video;
 #define FAST_DISPLAY_NS 33333333ull
@@ -176,6 +186,8 @@ static struct {
 static char library_file[PATH_CAP], favorites_file[PATH_CAP];
 static float flow_position, flow_start, flow_drag_origin;
 static uint64_t flow_started, flow_draw_at, title_since, system_slide_started;
+static uint64_t prefetch_selection, prefetch_at;
+static int prefetched, last_marquee_offset;
 static bool touching_flow;
 static enum { TOUCH_TAP, TOUCH_HORIZONTAL, TOUCH_VERTICAL } flow_gesture;
 static int flow_down_x, flow_down_y, system_slide_direction, system_slide_offset;
@@ -196,7 +208,8 @@ static int flow_down_x, flow_down_y, system_slide_direction, system_slide_offset
 #define LIST_TOP 58
 #define LIST_ROW 42
 #define SYSTEM_GESTURE_PX 38
-static uint32_t cart[CART_WIDTH * CART_HEIGHT], canvas[WIDTH * HEIGHT], color[65536];
+static uint32_t cart[CART_WIDTH * CART_HEIGHT], color[65536];
+static uint32_t *canvas;
 static bool smoke, have_frame, use_dynarec;
 static volatile sig_atomic_t launch_stage;
 static uint64_t speed_start;
@@ -283,6 +296,7 @@ static int clamp(int x, int low, int high) { return x < low ? low : x > high ? h
 /* 2x has headroom with the original path. At higher targets pace video by
  * elapsed time, leaving extra GBA frames to advance without a panel update. */
 static bool paced_video(void) { return screen == GAME && fast && (fast_rate >= 3 || core != &gpsp); }
+static uint64_t sooner(uint64_t a, uint64_t b) { return a < b ? a : b; }
 static void schedule_video(uint64_t now) {
     allow_video = screen == GAME && (!paced_video() || !next_video || now >= next_video);
     if (paced_video() && allow_video) {
@@ -431,12 +445,22 @@ static Picture game_picture(void) {
 
 static void draw_nearest(Picture p) {
     int left = clamp(p.x, 0, WIDTH), right = clamp(p.x + p.width, 0, WIDTH);
-    int lookup[WIDTH];
-    for (int x = left; x < right; ++x) lookup[x] = (x - p.x) * cart_width / p.width;
-    for (int y = clamp(p.y, 0, HEIGHT); y < clamp(p.y + p.height, 0, HEIGHT); ++y) {
-        const uint32_t *source = cart + ((y - p.y) * cart_height / p.height) * cart_width;
-        uint32_t *dest = canvas + y * WIDTH;
-        for (int x = left; x < right; ++x) dest[x] = source[lookup[x]];
+    static int columns[WIDTH], rows[HEIGHT];
+    static Picture previous;
+    static unsigned width, height;
+    const int top = clamp(p.y, 0, HEIGHT), bottom = clamp(p.y + p.height, 0, HEIGHT);
+    if (width != cart_width || height != cart_height || memcmp(&p, &previous, sizeof p)) {
+        for (int x = left; x < right; ++x) columns[x] = (x - p.x) * cart_width / p.width;
+        for (int y = top; y < bottom; ++y) rows[y] = (y - p.y) * cart_height / p.height;
+        previous = p;
+        width = cart_width;
+        height = cart_height;
+    }
+    uint32_t *pixels = canvas;
+    for (int y = top; y < bottom; ++y) {
+        const uint32_t *source = cart + rows[y] * cart_width;
+        uint32_t *dest = pixels + y * WIDTH;
+        for (int x = left; x < right; ++x) dest[x] = source[columns[x]];
     }
 }
 
@@ -484,17 +508,25 @@ static const uint32_t *sharp_row(uint32_t cache[2][WIDTH], int cached[2],
 }
 
 static void draw_sharp(Picture p) {
-    VideoSample columns[WIDTH], rows[HEIGHT];
+    static VideoSample columns[WIDTH], rows[HEIGHT];
+    static Picture previous;
+    static unsigned width, height;
     uint32_t row_cache[2][WIDTH];
     int cached[2] = {-1, -1};
     int left = clamp(p.x, 0, WIDTH), right = clamp(p.x + p.width, 0, WIDTH);
     int top = clamp(p.y, 0, HEIGHT), bottom = clamp(p.y + p.height, 0, HEIGHT);
-    sharp_axis(columns, left, right, p.x, p.width, cart_width);
-    sharp_axis(rows, top, bottom, p.y, p.height, cart_height);
+    if (width != cart_width || height != cart_height || memcmp(&p, &previous, sizeof p)) {
+        sharp_axis(columns, left, right, p.x, p.width, cart_width);
+        sharp_axis(rows, top, bottom, p.y, p.height, cart_height);
+        previous = p;
+        width = cart_width;
+        height = cart_height;
+    }
+    uint32_t *pixels = canvas;
     for (int y = top; y < bottom; ++y) {
         int source_y = rows[y].pixel;
         const uint32_t *row = sharp_row(row_cache, cached, columns, source_y, left, right);
-        uint32_t *dest = canvas + y * WIDTH;
+        uint32_t *dest = pixels + y * WIDTH;
         if (rows[y].weight) {
             const uint32_t *next = sharp_row(row_cache, cached, columns, source_y + 1, left, right);
             for (int x = left; x < right; ++x)
@@ -507,7 +539,11 @@ static void draw_sharp(Picture p) {
 
 static void draw_game(void) {
     Picture picture = game_picture();
-    memset(canvas, 0, sizeof canvas);
+    int right = picture.x + picture.width, bottom = picture.y + picture.height;
+    if (picture.x > 0) rect(0, 0, picture.x, HEIGHT, 0);
+    if (right < WIDTH) rect(right, 0, WIDTH - right, HEIGHT, 0);
+    if (picture.y > 0) rect(0, 0, WIDTH, picture.y, 0);
+    if (bottom < HEIGHT) rect(0, bottom, WIDTH, HEIGHT - bottom, 0);
     if (video_filter == SHARP_BILINEAR &&
         (picture.width % cart_width || picture.height % cart_height)) draw_sharp(picture);
     else draw_nearest(picture);
@@ -550,6 +586,17 @@ static int file_write(const char *path, const void *data, size_t length) {
     unlink(temp);
     return false;
 }
+static uint64_t display_deadline(uint64_t now) {
+    if (!display_bridge || dimmed || native_yielded || screen == GAME) return UINT64_MAX;
+    uint64_t deadline = last_activity + DISPLAY_IDLE_NS;
+    if (now < deadline) return deadline;
+    if (file_write(DISPLAY_REQUEST, "1", 1)) {
+        dimmed = true;
+        return UINT64_MAX;
+    }
+    last_activity = now; /* Try again after the next idle interval. */
+    return now + DISPLAY_IDLE_NS;
+}
 static void request_audio(enum AudioAction action, int value) {
     if (!audio_bridge || pending_action) return;
     bool opening = action == AUDIO_NOW_PLAYING;
@@ -572,8 +619,12 @@ static void request_audio(enum AudioAction action, int value) {
     audio_request_time = clock_ns();
     dirty = 1;
 }
+static uint64_t audio_deadline(void) {
+    if (!audio_bridge) return UINT64_MAX;
+    return audio_polled + (pending_action || native_yielded || screen == AUDIO ? 75000000ull : 500000000ull);
+}
 static void audio_poll(uint64_t now) {
-    if (!audio_bridge || now - audio_polled < 75000000ull) return;
+    if (now < audio_deadline()) return;
     audio_polled = now;
     struct AudioReply next = {0};
     FILE *file = fopen(AUDIO_REPLY, "rb");
@@ -604,6 +655,7 @@ static void audio_poll(uint64_t now) {
         }
         if (native_yielded && !next.native_ui && !pending_action) {
             native_yielded = false;
+            last_activity = now;
             platform_resume_from_player();
             physical_keys = pressed_this_frame = touch_keys = 0;
             held_buttons = gameplay_buttons = 0;
@@ -618,7 +670,11 @@ static void audio_poll(uint64_t now) {
     if (pending_action && now - audio_request_time > 5000000000ull) {
         if ((pending_action == AUDIO_MUSIC || pending_action == AUDIO_NOW_PLAYING) && !music_mode)
             platform_audio_select(audio_route, audio_reply.magic ? audio_reply.gain : 100);
-        if (native_yielded) { native_yielded = false; platform_resume_from_player(); }
+        if (native_yielded) {
+            native_yielded = false;
+            last_activity = now;
+            platform_resume_from_player();
+        }
         pending_action = 0;
         status("Q2 audio request timed out");
     }
@@ -784,22 +840,34 @@ static bool state_info(int number, time_t *when) {
     if (when) *when = st.st_mtime;
     return true;
 }
-static void battery_io(unsigned kind, const char *suffix, bool save) {
+typedef struct { void *bytes; size_t size; } SavedMemory;
+static SavedMemory saved_ram, saved_rtc;
+static void battery_io(unsigned kind, const char *suffix, bool save, SavedMemory *saved) {
     char path[PATH_CAP];
     size_t size = core->get_memory_size(kind);
     void *data = core->get_memory_data(kind);
     if (!size || !data || !save_path(path, suffix, save)) return;
+    if (saved->size != size) {
+        free(saved->bytes);
+        saved->bytes = malloc(size);
+        saved->size = 0;
+    }
     if (save) {
-        if (!file_write(path, data, size)) status("Could not write in-game save");
+        if (saved->size == size && !memcmp(saved->bytes, data, size)) return;
+        if (!file_write(path, data, size)) { status("Could not write in-game save"); return; }
     } else {
         FILE *file = fopen(path, "rb");
         if (file) { (void)fread(data, 1, size, file); fclose(file); }
     }
+    if (saved->bytes) {
+        memcpy(saved->bytes, data, size);
+        saved->size = size;
+    }
 }
 static void cartridge_saves(bool save) {
-    battery_io(RETRO_MEMORY_SAVE_RAM, ".srm", save);
+    battery_io(RETRO_MEMORY_SAVE_RAM, ".srm", save, &saved_ram);
     if (core == &shared_cores[GAMBATTE].api || core == &shared_cores[SNES9X2005].api)
-        battery_io(RETRO_MEMORY_RTC, ".rtc", save);
+        battery_io(RETRO_MEMORY_RTC, ".rtc", save, &saved_rtc);
 }
 static bool state_io(enum Action action, int number) {
     size_t length = core->serialize_size();
@@ -861,6 +929,7 @@ static void set_screen(enum Screen next) {
     flow_started = 0;
     previous_shelf = NULL;
     title_since = clock_ns();
+    last_activity = title_since;
     physical_keys = gameplay_buttons = 0;
     menu_focus = wheel_delta = 0;
     pressed_this_frame = 0;
@@ -901,8 +970,7 @@ static void set_fast(void) {
     dirty = 1;
 }
 static bool emulation_active(void) {
-    return running && (screen == GAME || screen == BROWSER || screen == BROWSER_OPTIONS ||
-                       screen == APP_MENU || screen == COPY_TARGET || screen == COPY_SOURCE);
+    return running && screen == GAME;
 }
 static void load_library(void) {
     FILE *file = fopen(library_file, "rb");
@@ -1247,6 +1315,10 @@ static void finish_rom(bool save) {
         if (save) cartridge_saves(true);
         core->unload_game();
     }
+    free(saved_ram.bytes);
+    free(saved_rtc.bytes);
+    saved_ram = (SavedMemory){0};
+    saved_rtc = (SavedMemory){0};
     launch_stage = 0;
     release_core();
     running = 0;
@@ -1394,20 +1466,25 @@ static int text_width(const char *text, const unsigned char *widths) {
     return width;
 }
 
+static int marquee_offset(int overflow, uint64_t now) {
+    if (overflow <= 0 || now <= title_since) return 0;
+    uint64_t ms = (now - title_since) / 1000000;
+    unsigned sweep = (overflow * 1000 + MARQUEE_SPEED - 1) / MARQUEE_SPEED;
+    if (ms <= MARQUEE_WAIT_MS || ms >= 2 * (sweep + MARQUEE_WAIT_MS)) return 0;
+    unsigned at = (unsigned)ms - MARQUEE_WAIT_MS;
+    if (at >= 2 * sweep + MARQUEE_WAIT_MS) return 0;
+    if (at > sweep + MARQUEE_WAIT_MS) at = 2 * sweep + MARQUEE_WAIT_MS - at;
+    if (at > sweep) at = sweep;
+    return (int)(at * MARQUEE_SPEED / 1000);
+}
+
 static void caption(int y, const char *label, uint32_t ink, int size, uint64_t now) {
     bool title = size == 24;
     const unsigned char *widths = title ? advance_24 : advance_20;
     int w = text_width(label, widths), h = title ? 28 : 24;
     int x = (WIDTH - w) / 2;
     int max_width = WIDTH - CAPTION_EDGE * 2;
-    if (w > max_width) {
-        uint64_t ms = now > title_since ? (now - title_since) / 1000000 : 0;
-        unsigned overflow = w - max_width;
-        unsigned sweep_ms = overflow * 1000 / MARQUEE_SPEED;
-        unsigned at = ms % (2 * (sweep_ms + MARQUEE_WAIT_MS));
-        if (at > sweep_ms + MARQUEE_WAIT_MS) at = 2 * (sweep_ms + MARQUEE_WAIT_MS) - at;
-        x = CAPTION_EDGE - (int)(at > MARQUEE_WAIT_MS ? (at - MARQUEE_WAIT_MS) * MARQUEE_SPEED / 1000 : 0);
-    }
+    if (w > max_width) x = CAPTION_EDGE - marquee_offset(w - max_width, now);
     for (; *label && x < WIDTH - CAPTION_EDGE; ++label) {
         int glyph = glyph_index((unsigned char)*label);
         const void *mask = title ? (const void *)&glyphs_24[glyph] : &glyphs_20[glyph];
@@ -1463,6 +1540,9 @@ static void draw_shelf(const RomShelf *page, float position, int offset_y, uint6
         draw_heart(center, heart_x, heart_y + offset_y);
     char title[256];
     selected_title(page, mid, title);
+    if (page == shelf)
+        last_marquee_offset = marquee_offset(text_width(title, advance_24) -
+                                              (WIDTH - CAPTION_EDGE * 2), now);
     caption(254 + offset_y, title, RGB(0xffffff), 24, now);
     caption(282 + offset_y, shelf_names[page - shelves], RGB(0xaaaaaa), 20, now);
 }
@@ -1528,8 +1608,9 @@ static void draw_browser(void) {
     browser_button(APP_MENU_X, BROWSER_BUTTON_Y, APP_MENU_W, "Menu", true);
 }
 
-static void update_browser(uint64_t now) {
-    if (screen != BROWSER || browser_list() || now < flow_draw_at) return;
+static uint64_t update_browser(uint64_t now) {
+    if (screen != BROWSER || browser_list()) return UINT64_MAX;
+    if (now < flow_draw_at) return flow_draw_at;
     flow_draw_at = now + BROWSER_FRAME_NS;
     if (previous_shelf) {
         uint64_t elapsed = now >= system_slide_started ? now - system_slide_started : 0;
@@ -1552,14 +1633,50 @@ static void update_browser(uint64_t now) {
             flow_position = shelf->selected + (flow_start - shelf->selected) * remaining * remaining * remaining;
         }
         dirty = 1;
-    } else if (shelf_has_games(shelf)) {
+    }
+    if (previous_shelf || flow_started) return flow_draw_at;
+    if (shelf_has_games(shelf)) {
+        uint64_t deadline = UINT64_MAX;
+        if (prefetch_selection != title_since) {
+            prefetch_selection = title_since;
+            prefetch_at = title_since + 220000000ull;
+            prefetched = 0;
+        }
+        if (!touching_flow && prefetched < 4) {
+            if (now >= prefetch_at) {
+                int distance = 4 + prefetched / 2;
+                int index = shelf->selected + (prefetched % 2 ? -distance : distance);
+                if (index >= shelf->first && index < shelf->end) {
+                    const Rom *rom = shelf_rom(shelf, index);
+                    cover_prefetch(rom_directory(rom), rom->legacy ? NULL : data_paths.roms,
+                                   rom->name, rom->system);
+                }
+                ++prefetched;
+                prefetch_at = clock_ns() + 50000000ull;
+            }
+            if (prefetched < 4) deadline = prefetch_at;
+        }
         char title[256];
         selected_title(shelf, shelf->selected, title);
-        if (text_width(title, advance_24) > WIDTH - CAPTION_EDGE * 2) dirty = 1;
+        int overflow = text_width(title, advance_24) - (WIDTH - CAPTION_EDGE * 2);
+        if (overflow > 0) {
+            uint64_t start = title_since + MARQUEE_WAIT_MS * 1000000ull;
+            uint64_t sweep = (overflow * 1000ull + MARQUEE_SPEED - 1) / MARQUEE_SPEED * 1000000ull;
+            uint64_t returning = start + sweep + MARQUEE_WAIT_MS * 1000000ull;
+            uint64_t end = returning + sweep;
+            if (marquee_offset(overflow, now) != last_marquee_offset) dirty = 1;
+            if (now < start) deadline = sooner(deadline, start);
+            else if (now < start + sweep || (now >= returning && now < end))
+                deadline = sooner(deadline, sooner(flow_draw_at, end));
+            else if (now < returning) deadline = sooner(deadline, returning);
+        }
+        return deadline;
     }
+    return UINT64_MAX;
 }
 
 static void draw_ui(void) {
+    canvas = platform_canvas();
     char label[256], sub[128];
     switch (screen) {
     case GAME: draw_game(); break;
@@ -1640,7 +1757,7 @@ static void draw_ui(void) {
         rect(37, HEIGHT - 29, WIDTH - 74, 23, DARK);
         text_at(45, HEIGHT - 26, notice, ACCENT, WIDTH - 42);
     }
-    if (!smoke) platform_present(canvas, paced_video() || screen == BROWSER || screen == BROWSER_OPTIONS);
+    if (!smoke) platform_present(paced_video() || screen == BROWSER || screen == BROWSER_OPTIONS);
     dirty = 0;
 }
 
@@ -1758,7 +1875,7 @@ static void activate_menu(int index) {
         } else if (index == SORT_COUNT) {
             library.list = !library.list;
             store_library();
-        } else scan_roms();
+        } else { cover_cache_clear(); scan_roms(); }
         set_screen(BROWSER);
         break;
     case MENU:
@@ -1778,7 +1895,7 @@ static void activate_menu(int index) {
             menu_focus = audio_bridge ? (music_mode ? 0 : 1) : 2;
             if (!audio_bridge && !local_volume) menu_focus = 3;
             break;
-        case 7: scan_roms(); set_screen(BROWSER); break;
+        case 7: cover_cache_clear(); scan_roms(); set_screen(BROWSER); break;
         case 8: quitting = 1; break;
         }
         break;
@@ -2047,6 +2164,34 @@ static int decode_key(Event e) {
     return -1;
 }
 static void read_event(Event e) {
+    if (display_bridge) {
+        int key = decode_key(e);
+        if (wake_touch && e.kind == 't') {
+            if (e.action == 'u') wake_touch = false;
+            return;
+        }
+        if (key >= 0 && key == wake_key) {
+            if (e.action == 'u') wake_key = -1;
+            return;
+        }
+        if (e.kind == 'r') wake_key = -1;
+        if (e.kind == 'w' || e.kind == 't' || key >= 0) {
+            last_activity = clock_ns();
+            if (dimmed) {
+                bool was_dimmed = !access(DISPLAY_DIMMED, F_OK);
+                if (!file_write(DISPLAY_REQUEST, "0", 1)) return;
+                dimmed = false;
+                if (was_dimmed) {
+                    wake_key = e.action == 'd' ? key : -1;
+                    wake_touch = e.kind == 't' && e.action != 'u';
+                    touching_flow = false;
+                    held_buttons = gameplay_buttons = 0;
+                    physical_keys = touch_keys = pressed_this_frame = 0;
+                    return;
+                }
+            }
+        }
+    }
     if (e.kind == 'w') { read_wheel(e.x); return; }
     if (e.kind == 't') { read_touch(e.action, e.x, e.y); return; }
     if (e.kind == 'r') {
@@ -2108,7 +2253,8 @@ static bool environment(unsigned command, void *data) {
         return true;
     }
     case RETRO_ENVIRONMENT_GET_AUDIO_VIDEO_ENABLE:
-        *(int *)data = 2 | (allow_video ? 1 : 0);
+        *(int *)data = ((smoke ? !smoke_mute : !music_mode && !fast && screen == GAME) ? 2 : 0) |
+                       (allow_video ? 1 : 0);
         return true;
     case RETRO_ENVIRONMENT_GET_CAN_DUPE: *(bool *)data = true; return true;
     case RETRO_ENVIRONMENT_GET_VARIABLE_UPDATE:
@@ -2349,11 +2495,8 @@ static int smoke_test(const char *path) {
     const struct Core *previous_core = core;
     read_touch('d', 84, 247);
     schedule_video(clock_ns());
-    if (screen != BROWSER || !emulation_active() || allow_video || core != previous_core ||
+    if (screen != BROWSER || emulation_active() || allow_video || core != previous_core ||
         slot != 3) { close_rom(); return 27; }
-    unsigned frames_before = video_frames;
-    core->run();
-    if (video_frames != frames_before) { close_rom(); return 28; }
     read_touch('d', EXIT_X + 25, BROWSER_BUTTON_Y + 13);
     read_touch('u', EXIT_X + 25, BROWSER_BUTTON_Y + 13);
     if (quitting || screen != GAME || !running || core != previous_core ||
@@ -2385,8 +2528,15 @@ static int smoke_test(const char *path) {
     video_frames = 0;
     for (int frame = 0; frame < 6; ++frame) core->run();
     if (video_frames != 6) { close_rom(); return 12; }
+    smoke_audio_frames = 0;
+    smoke_mute = true;
+    for (int frame = 0; frame < 8; ++frame) core->run();
+    smoke_mute = false;
+    if (smoke_audio_frames) { close_rom(); return 32; }
+    for (int frame = 0; frame < 8; ++frame) core->run();
+    if (!smoke_audio_frames) { close_rom(); return 33; }
     close_rom();
-    puts("PASS: ROM, two save slots, new controls, wheel disabled during gameplay, wheel menus, instant state return, speed selection, persistent remapping, timed core video budget");
+    puts("PASS: ROM, save slots, controls, library pause and resume, speed selection, video budget, audio mute and resume");
     return 0;
 }
 static void write_fatal(int sig) {
@@ -2421,6 +2571,11 @@ static void log_launch(void) {
         FILE *f = fopen(flag, "r");
         if (f) { use_dynarec = fgetc(f) == '1'; fclose(f); }
     }
+    if (file_path(flag, sizeof flag, data_dir, "/performance-log.txt")) {
+        FILE *f = fopen(flag, "r");
+        if (f) { performance_log = fgetc(f) == '1'; fclose(f); }
+    }
+    platform_set_diagnostics(performance_log);
     struct sigaction action = {.sa_handler = write_fatal};
     sigemptyset(&action.sa_mask);
     sigaction(SIGILL, &action, NULL);
@@ -2428,7 +2583,7 @@ static void log_launch(void) {
     sigaction(SIGSEGV, &action, NULL);
     sigaction(SIGABRT, &action, NULL);
     sigaction(SIGFPE, &action, NULL);
-    fprintf(stderr, "\nq2-boy 0.3.4, engine=%s\n",
+    fprintf(stderr, "\nq2-boy 0.3.5, engine=%s\n",
             use_dynarec ? "dynamic recompiler (opt-in)" : "interpreter");
     FILE *memory = fopen("/proc/meminfo", "r");
     if (memory) {
@@ -2458,6 +2613,8 @@ int main(int argc, char **argv) {
         const char *bridge = getenv("Q2_BOY_AUDIO_BRIDGE");
         audio_bridge = bridge != NULL;
         native_supported = bridge && *bridge == '2';
+        const char *display = getenv("Q2_BOY_DISPLAY_BRIDGE");
+        display_bridge = display && !strcmp(display, "1");
         music_mode = audio_bridge && argc == 1;
         audio_route = argc > 1 && !strcmp(argv[1], "plug:bluealsa") ? 1 :
                       argc > 1 && !strcmp(argv[1], "usb") ? (argc > 2 && argv[2][0] == 'h' ? 3 : 2) : 0;
@@ -2481,7 +2638,9 @@ int main(int argc, char **argv) {
     load_library();
     load_favorites();
     library_migrate(&data_paths);
+    cover_cache_open(data_dir);
     scan_roms();
+    last_activity = clock_ns();
     uint64_t next_frame = 0;
     while (!quitting) {
         Event e;
@@ -2491,35 +2650,61 @@ int main(int argc, char **argv) {
         now = clock_ns();
         if (notice_end && now >= notice_end) { notice_end = 0; dirty = 1; }
         bool advance = emulation_active();
-        bool display_game = screen == GAME;
         if (advance && now >= next_frame) {
-            uint64_t period = (uint64_t)(1000000000.0 / (fps * (display_game && fast ? fast_rate : 1)));
+            uint64_t period = (uint64_t)(1000000000.0 / (fps * (fast ? fast_rate : 1)));
+            if (performance_log && next_frame && now - next_frame >= period) ++late_frames;
             if (!next_frame || now - next_frame > period * 3) next_frame = now;
             next_frame += period;
             launch_stage = have_frame ? 4 : 3;
-            if (display_game && !speed_start) { speed_start = now; speed_frames = video_frames = 0; }
-            if (display_game && now - speed_start >= (fast ? 2000000000ull : 5000000000ull)) {
+            if (!speed_start) { speed_start = now; speed_frames = video_frames = 0; }
+            if ((fast || performance_log) && now - speed_start >= (fast ? 2000000000ull : 5000000000ull)) {
                 double measured = speed_frames * 1000000000.0 / (now - speed_start);
                 if (fast) { measured_speed = measured / fps; dirty = 1; }
                 double pictures = video_frames * 1000000000.0 / (now - speed_start);
-                fprintf(stderr, "%s (target %dx): %.1f emulated frames/s (%.2fx), %.1f pictures/s\n",
-                        fast ? "Fast-forward" : "Normal speed", fast ? fast_rate : 1,
-                        measured, measured / fps, pictures);
+                if (performance_log) {
+                    PlatformStats stats = platform_take_stats();
+                    fprintf(stderr, "%dx: %.1f emulated fps, %.1f video fps, %u flips, %u late, "
+                            "%u overwritten frames, max us: core %u draw %u flip %u, "
+                            "%u underruns, %u discarded audio frames\n",
+                            fast ? fast_rate : 1, measured, pictures, stats.flips, late_frames,
+                            stats.dropped_frames, longest_run_us, longest_draw_us, stats.longest_flip_us,
+                            stats.underruns, stats.dropped_samples);
+                    late_frames = longest_run_us = longest_draw_us = 0;
+                }
                 speed_start = now;
                 speed_frames = video_frames = 0;
             }
             schedule_video(now);
+            uint64_t started = performance_log ? clock_ns() : 0;
             core->run();
-            ++speed_frames;
+            if (fast || performance_log) ++speed_frames;
+            if (performance_log) {
+                unsigned elapsed = (clock_ns() - started) / 1000;
+                if (elapsed > longest_run_us) longest_run_us = elapsed;
+            }
             pressed_this_frame = 0;
         } else if (!advance) next_frame = 0;
         if (running && now >= next_save) {
             cartridge_saves(true);
             next_save = now + 20000000000ull;
         }
-        update_browser(now);
-        if (dirty && !native_yielded) draw_ui();
-        if (!advance || clock_ns() < next_frame) usleep(1000);
+        platform_audio_service();
+        uint64_t browse_at = update_browser(now);
+        if (dirty && !native_yielded) {
+            uint64_t started = performance_log ? clock_ns() : 0;
+            draw_ui();
+            if (performance_log) {
+                unsigned elapsed = (clock_ns() - started) / 1000;
+                if (elapsed > longest_draw_us) longest_draw_us = elapsed;
+            }
+        }
+        uint64_t deadline = advance ? next_frame : UINT64_MAX;
+        deadline = sooner(deadline, sooner(browse_at, audio_deadline()));
+        if (notice_end) deadline = sooner(deadline, notice_end);
+        if (running) deadline = sooner(deadline, next_save);
+        if (platform_audio_pending()) deadline = sooner(deadline, now + 3000000ull);
+        deadline = sooner(deadline, display_deadline(now));
+        platform_wait(deadline);
     }
     close_rom();
     close_shared_cores();

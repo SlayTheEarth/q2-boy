@@ -60,8 +60,13 @@ its favorite status. A white outline means unpinned and a red heart means pinned
 
 Turn the wheel, swipe horizontally, or use Previous and Next to browse games
 within a shelf. Tap a side cover to select it. Press Centre or tap the center
-cover to launch it. **Exit** is in the top left and becomes **Resume** while a
-game is running.
+cover to launch it. **Exit** is in the top left and becomes **Resume** when a
+game is loaded. The game pauses while you browse or use a menu.
+
+Pocket Boy preloads nearby artwork and caches up to 64 resized
+covers on the SD card. **Refresh ROMs and covers** clears the cache. Compatible
+firmware can dim the screen after 30 seconds of inactivity in menus and
+the library. The first touch, button press, or wheel turn wakes the screen.
 
 Add a `.png`, `.jpg`, or `.jpeg` beside the ROM using the same base name,
 including spaces and punctuation. For example, place

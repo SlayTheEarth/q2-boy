@@ -11,6 +11,10 @@ enum CartridgeSystem { SYSTEM_GB, SYSTEM_GBC, SYSTEM_GBA, SYSTEM_NES, SYSTEM_SNE
 #define COVER_REACH 3.5f
 
 void cover_clear(void);
+void cover_cache_open(const char *data_dir);
+void cover_cache_clear(void);
+void cover_prefetch(const char *directory, const char *fallback, const char *name,
+                    enum CartridgeSystem system);
 void cover_draw(uint32_t *canvas, const char *directory, const char *fallback, const char *name,
                 enum CartridgeSystem system, float distance, int offset_y);
 bool cover_hit(const char *directory, const char *fallback, const char *name, enum CartridgeSystem system,

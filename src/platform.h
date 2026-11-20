@@ -17,7 +17,16 @@ void platform_close(void);
 void platform_yield_to_player(void);
 void platform_resume_from_player(void);
 int platform_event(Event *event);
-void platform_present(const uint32_t *pixels, int asynchronous);
+void platform_wait(uint64_t deadline);
+uint32_t *platform_canvas(void);
+void platform_present(int asynchronous);
+void platform_audio_service(void);
+int platform_audio_pending(void);
+typedef struct {
+    unsigned flips, dropped_frames, longest_flip_us, underruns, dropped_samples;
+} PlatformStats;
+void platform_set_diagnostics(int enabled);
+PlatformStats platform_take_stats(void);
 void platform_audio_write(const int16_t *samples, unsigned frames, int muted);
 void platform_audio_reset(void);
 uint64_t clock_ns(void);

@@ -1,0 +1,120 @@
+diff --git a/patch/addon.c b/patch/addon.c
+index 5e79197..839e3e6 100644
+--- a/patch/addon.c
++++ b/patch/addon.c
+@@ -832,10 +832,13 @@ static struct {
+     int boy_bridge, resume_owner, resume_status;
+     unsigned audio_poll, audio_seq, audio_last[9], native_at;
+     int native_ui;
++    int display_dimmed;
++    unsigned display_poll;
+     void *native_origin;
+ } gm __attribute__((section(".scratch")));
+ 
+ #include "boy_audio.h"
++#include "boy_display.h"
+ 
+ int addon_games(void) { return addon_scan(), ap.games; }
+ int addon_games_last(void) { return ap.games; }
+@@ -881,6 +884,8 @@ static int game_start(app_t *a) {
+     memset(gm.audio_last, 0, sizeof gm.audio_last);
+     int audio = a->audio;
+     if (gm.boy_bridge) {
++        boy_display_end();
++        gm.display_poll = 0;
+         unlink(BOY_AUDIO_REQUEST);
+         unlink(BOY_AUDIO_REPLY);
+         audio = !media_playing() && !boy_prefers_music();
+@@ -904,7 +909,10 @@ static int game_start(app_t *a) {
+          * thread holds libc's environment lock (stock's toolsSetTimeZone) hangs the child here;
+          * Return's hold ends it */
+         setenv("Q2_POPUP", pop, 1);
+-        if (gm.boy_bridge) setenv("Q2_BOY_AUDIO_BRIDGE", "2", 1);
++        if (gm.boy_bridge) {
++            setenv("Q2_BOY_AUDIO_BRIDGE", "2", 1);
++            setenv("Q2_BOY_DISPLAY_BRIDGE", "1", 1);
++        }
+         if (audio) /* q2video's arguments: the device, then a soft output's volume */
+             execl(a->bin, a->bin, dev ? dev : "plughw:0,0", dev ? vol : (char *)0, (char *)0);
+         else
+@@ -993,6 +1001,7 @@ static void game_poll(void) {
+         if (gm.audio && mclGetPlayStatus() == 3) player_stop();
+         gm.pid = gm.audio = 0;
+         if (gm.boy_bridge) {
++            boy_display_end();
+             gm.native_ui = 0;
+             boy_restore_music();
+             unlink(BOY_AUDIO_REQUEST);
+@@ -1006,6 +1015,7 @@ static void game_poll(void) {
+     }
+     unsigned now = (unsigned)time_now_ms();
+     boy_audio_poll(now);
++    boy_display_poll(now);
+     /* signed: a stamp can be just after now (| 1 rounds up, game_end reads the clock again) */
+     if (gm.held && (int)(now - gm.held) >= GAME_HOLD_MS) gm.held = 0, gm.eat = 1, game_end();
+     if (gm.term && (int)(now - gm.term) >= GAME_KILL_MS) gm.term = now | 1, game_kill("-9 ");
+diff --git a/patch/boy_display.h b/patch/boy_display.h
+new file mode 100644
+index 0000000..a20cb74
+--- /dev/null
++++ b/patch/boy_display.h
+@@ -0,0 +1,38 @@
++/* SPDX-License-Identifier: GPL-3.0-only */
++#define BOY_DISPLAY_REQUEST "/tmp/q2-boy.display.req"
++#define BOY_DISPLAY_DIMMED "/tmp/q2-boy.display.dimmed"
++
++static void boy_display_restore(void) {
++    if (!gm.display_dimmed) return;
++    gm.display_dimmed = 0;
++    if (g_backlight_status) toolSetBackLight(g_lightness + 1);
++    unlink(BOY_DISPLAY_DIMMED);
++}
++
++static void boy_display_end(void) {
++    boy_display_restore();
++    unlink(BOY_DISPLAY_REQUEST);
++    unlink(BOY_DISPLAY_DIMMED);
++}
++
++static void boy_display_poll(unsigned now) {
++    if (!gm.boy_bridge) return;
++    if (gm.native_ui || !g_backlight_status) {
++        boy_display_restore();
++        return;
++    }
++    if (gm.display_poll && now - gm.display_poll < (gm.display_dimmed ? 80u : 250u))
++        return;
++    gm.display_poll = now;
++    char requested;
++    if (BLOB_IO(BOY_DISPLAY_REQUEST, requested, 0) && requested == '1') {
++        /* Stock brightness is zero-based. 1 is the minimum lit setting. */
++        if (!gm.display_dimmed && g_lightness &&
++            BLOB_IO(BOY_DISPLAY_DIMMED, requested, 1)) {
++            toolSetBackLight(1);
++            gm.display_dimmed = 1;
++        }
++    } else {
++        boy_display_restore();
++    }
++}
+diff --git a/tools/build.py b/tools/build.py
+index ca74a60..ae32bf8 100644
+--- a/tools/build.py
++++ b/tools/build.py
+@@ -1579,6 +1579,7 @@ FUNCTIONS = {
+  'save_memoryplay_info': ('int', 'void'),  # Memory playback's queue and position, as into_poweroff saves them
+  'mclSetDacPwr': ('int', 'int'),
+  'reset_poweroptions_timer': ('int', 'int, int, int'),
++ 'toolSetBackLight': ('int', 'int'),  # same hardware call as config_lightness, without persisting
+  'btctl_transport_get_volume': ('int', 'void'),
+  'btctl_transport_set_volume': ('int', 'int'),
+  'device_set_volume': ('int', 'int, int'),  # volume, notify: the DAC's or hciplayer's, as the volume dialog
+@@ -1656,7 +1657,7 @@ GLOBALS = ['tidal_albuminfo_thread_run', 'tidal_collection_thread_run',  # 2: a
+            'savestartbt', 'transposition', 'tidalfurlstart',  # a stream to start paused; 1 arms Now Playing's online tick (tidal.c app_start)
+            'isFav_playing',  # Now Playing's heart on a 0xf1 track: 1 a favourite (tidal.c app_fav)
+            'g_time_zone','g_playspeed_mode', 'g_time24h_flag', 'g_backlight_status', 'g_lockscreen_pageflag', 'g_testmode_flag',
+-           'g_keylock_flag', 'g_keylock_mode',
++           'g_keylock_flag', 'g_keylock_mode', 'g_lightness',
+            'g_bluetoothflag', 'bt_linkstatus', 'g_guideflag', 'g_poweroff_state', 'g_usblink_status', 'bt__recv_pageflag',
+            'g_power_longkey', 'g_ingore_bootkey_flag', 'g_equalizer_flag', 'g_navbar_status', 'g_playcover_type',
+            'g_keytone_flag', 'g_folder_layer', 'g_otg_status', 'g_delete_flag', 'g_volume', 'g_maxvolume',

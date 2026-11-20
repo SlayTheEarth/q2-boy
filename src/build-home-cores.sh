@@ -14,7 +14,7 @@ driver="$CC_Q2 $target -nostdlib -fuse-ld=$LD_Q2"
 
 # Disable optional HD packs and NTSC filtering to keep video at the NES resolution.
 make -C "$FCEUMM" -j "${JOBS:-4}" platform=unix HAVE_HDPACK=0 HAVE_NTSC=0 WANT_32BPP=0 \
-    CC="$CC_Q2 $target" LD="$driver" LDFLAGS="$flags" LIBS="$libs" \
+    CC="$CC_Q2 $target -DQ2_FRAME_BUDGET" LD="$driver" LDFLAGS="$flags" LIBS="$libs" \
     TARGET="$out/fceumm_libretro.so"
 
 # Build the standard core with its lighter audio engine.

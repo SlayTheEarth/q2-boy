@@ -11,6 +11,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <unistd.h>
 
 #include "jpeg7/jpeglib.h"
 
@@ -64,6 +65,8 @@ static bool png_available(void) {
 #define JPEG_SOURCE_LIMIT 2048
 #define COVER_FILE_LIMIT (8 * 1024 * 1024)
 #define CACHE_COUNT 14 /* Seven covers can be visible on each shelf during a system change. */
+#define DISK_CACHE_COUNT 64
+#define THUMBNAIL_FORMAT 0x51435431u
 #define PNG_MEMORY_LIMIT (4u * 1024u * 1024u)
 #define REFLECTION 46
 #define COVER_TOP 76
@@ -86,6 +89,78 @@ typedef struct {
 
 static Cover covers[CACHE_COUNT];
 static unsigned age;
+static char cache_dir[768];
+
+typedef struct {
+    uint64_t key;
+    uint32_t format, width, height;
+} ThumbnailHeader;
+
+void cover_cache_open(const char *data_dir) {
+    int length = snprintf(cache_dir, sizeof cache_dir, "%s/.cover-cache", data_dir);
+    struct stat st;
+    if (length < 0 || (size_t)length >= sizeof cache_dir ||
+        (mkdir(cache_dir, 0755) && (stat(cache_dir, &st) || !S_ISDIR(st.st_mode))))
+        cache_dir[0] = 0;
+}
+
+void cover_cache_clear(void) {
+    if (!cache_dir[0]) return;
+    char path[800];
+    for (unsigned i = 0; i < DISK_CACHE_COUNT; ++i) {
+        snprintf(path, sizeof path, "%s/%02x", cache_dir, i);
+        unlink(path);
+    }
+    snprintf(path, sizeof path, "%s/pending", cache_dir);
+    unlink(path);
+}
+
+static uint64_t thumbnail_key(const char *path, const struct stat64 *st) {
+    uint64_t hash = 14695981039346656037ull;
+    for (; *path; ++path) {
+        hash ^= (unsigned char)*path;
+        hash *= 1099511628211ull;
+    }
+    const uint64_t identity[] = {st->st_size, st->st_mtime, st->st_mtim.tv_nsec,
+                                 st->st_ctime, st->st_ctim.tv_nsec};
+    for (unsigned i = 0; i < sizeof identity / sizeof identity[0]; ++i) {
+        hash ^= identity[i];
+        hash *= 1099511628211ull;
+    }
+    return hash;
+}
+
+static bool load_thumbnail(const char *path, uint64_t key, Cover *cover) {
+    FILE *file = fopen(path, "rb");
+    if (!file) return false;
+    ThumbnailHeader header;
+    bool valid = fread(&header, sizeof header, 1, file) == 1 &&
+                 header.format == THUMBNAIL_FORMAT && header.key == key &&
+                 header.width && header.height &&
+                 header.width <= COVER_SIZE && header.height <= COVER_SIZE;
+    if (valid) {
+        size_t count = header.width * header.height;
+        valid = fread(cover->pixels, sizeof cover->pixels[0], count, file) == count;
+        if (valid) {
+            cover->width = header.width;
+            cover->height = header.height;
+        }
+    }
+    fclose(file);
+    return valid;
+}
+
+static void store_thumbnail(const char *path, uint64_t key, const Cover *cover) {
+    char temporary[800];
+    snprintf(temporary, sizeof temporary, "%s/pending", cache_dir);
+    FILE *file = fopen(temporary, "wb");
+    if (!file) return;
+    ThumbnailHeader header = {key, THUMBNAIL_FORMAT, cover->width, cover->height};
+    size_t count = cover->width * cover->height;
+    bool written = fwrite(&header, sizeof header, 1, file) == 1 &&
+                   fwrite(cover->pixels, sizeof cover->pixels[0], count, file) == count;
+    if (fclose(file) || !written || rename(temporary, path)) unlink(temporary);
+}
 
 static void png_fail(Png *decoder, const char *message) {
     (void)message;
@@ -289,10 +364,18 @@ static bool read_cover(const char *path, Cover *cover, bool is_png) {
     struct stat64 st;
     if (stat64(path, &st) || !S_ISREG(st.st_mode) || st.st_size < 8 ||
         st.st_size > COVER_FILE_LIMIT) return false;
+    char thumb[800];
+    uint64_t key = 0;
+    if (cache_dir[0]) {
+        key = thumbnail_key(path, &st);
+        snprintf(thumb, sizeof thumb, "%s/%02x", cache_dir, (unsigned)(key % DISK_CACHE_COUNT));
+        if (load_thumbnail(thumb, key, cover)) return true;
+    }
     FILE *file = fopen(path, "rb");
     if (!file) return false;
     bool ok = is_png ? read_png(file, cover) : read_jpeg(file, cover);
     fclose(file);
+    if (ok && cache_dir[0]) store_thumbnail(thumb, key, cover);
     return ok;
 }
 
@@ -352,6 +435,11 @@ static const Cover *find_cover(const char *directory, const char *fallback, cons
     if (!artwork_in(directory, name, oldest) && (!fallback || !artwork_in(fallback, name, oldest)))
         cartridge_icon(oldest, system);
     return oldest;
+}
+
+void cover_prefetch(const char *directory, const char *fallback, const char *name,
+                    enum CartridgeSystem system) {
+    (void)find_cover(directory, fallback, name, system);
 }
 
 static uint32_t composite(uint32_t color, uint32_t background, unsigned alpha) {

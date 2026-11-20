@@ -1,0 +1,72 @@
+diff --git a/libretro.c b/libretro.c
+index f64b71c..d200113 100644
+--- a/libretro.c
++++ b/libretro.c
+@@ -370,7 +370,7 @@ static void S9xAudioCallback(void)
+ }
+ #endif
+ 
+-static void audio_upload_samples(void)
++static void audio_upload_samples(bool enabled)
+ {
+    size_t available_frames;
+ #ifdef USE_BLARGG_APU
+@@ -378,6 +378,12 @@ static void audio_upload_samples(void)
+ 
+    S9xAudioCallback();
+ 
++   if (!enabled)
++   {
++      audio_out_buffer_pos = 0;
++      return;
++   }
++
+    audio_out_buffer_ptr = audio_out_buffer;
+    available_frames     = audio_out_buffer_pos >> 1;
+ 
+@@ -423,7 +429,9 @@ static void audio_upload_samples(void)
+    else
+       S9xMixSamples(audio_out_buffer, available_frames << 1);
+ 
+-   audio_batch_cb(audio_out_buffer, available_frames);
++   /* The light mixer also advances audio state, even if samples are muted. */
++   if (enabled)
++      audio_batch_cb(audio_out_buffer, available_frames);
+ #endif
+ }
+ 
+@@ -636,6 +644,7 @@ void retro_run(void)
+    bool updated = false;
+    int result;
+    bool okay;
++   bool audioEnabled = true;
+ 
+    if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE_UPDATE, &updated) && updated)
+       check_variables(false);
+@@ -649,7 +658,7 @@ void retro_run(void)
+    okay = environ_cb(RETRO_ENVIRONMENT_GET_AUDIO_VIDEO_ENABLE, &result);
+    if (okay)
+    {
+-      bool audioEnabled = 0 != (result & 2);
++      audioEnabled = 0 != (result & 2);
+       bool videoEnabled = 0 != (result & 1);
+       bool hardDisableAudio = 0 != (result & 8);
+       IPPU.RenderThisFrame = videoEnabled;
+@@ -722,7 +731,7 @@ void retro_run(void)
+    RETRO_PERFORMANCE_STOP(S9xMainLoop_func);
+ 
+ #ifdef NO_VIDEO_OUTPUT
+-   audio_upload_samples();
++   audio_upload_samples(audioEnabled);
+    return;
+ #endif
+ 
+@@ -748,7 +757,7 @@ void retro_run(void)
+    else
+       video_cb(NULL, IPPU.RenderedScreenWidth, IPPU.RenderedScreenHeight, GFX.Pitch);
+ 
+-   audio_upload_samples();
++   audio_upload_samples(audioEnabled);
+ }
+ 
+ bool S9xReadMousePosition(int32_t which1, int32_t* x, int32_t* y, uint32_t* buttons)

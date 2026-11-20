@@ -1,0 +1,38 @@
+diff --git a/libgambatte/libretro/libretro.cpp b/libgambatte/libretro/libretro.cpp
+index 15b042c..099ce16 100644
+--- a/libgambatte/libretro/libretro.cpp
++++ b/libgambatte/libretro/libretro.cpp
+@@ -2924,6 +2924,10 @@ void retro_run()
+    input_poll_cb();
+    update_input_state();
+ 
++   int enabled = 3;
++   if (!environ_cb(RETRO_ENVIRONMENT_GET_AUDIO_VIDEO_ENABLE, &enabled))
++      enabled = 3;
++
+    uint64_t expected_frames = libretro_samples_count / SOUND_SAMPLES_PER_FRAME;
+    if (libretro_frames_count < expected_frames) // Detect frame dupes.
+    {
+@@ -2963,7 +2967,8 @@ void retro_run()
+    if (blend_frames)
+       blend_frames();
+ 
+-   video_cb(video_buf, VIDEO_WIDTH, VIDEO_HEIGHT, VIDEO_PITCH * sizeof(gambatte::video_pixel_t));
++   video_cb((enabled & 1) ? video_buf : NULL, VIDEO_WIDTH, VIDEO_HEIGHT,
++         VIDEO_PITCH * sizeof(gambatte::video_pixel_t));
+ 
+    if (use_cc_resampler)
+       CC_renderaudio((audio_frame_t*)sound_buf.u32, samples);
+@@ -2975,7 +2980,11 @@ void retro_run()
+       audio_out_buffer_read_blipper(read_avail);
+    }
+    libretro_samples_count += samples;
+-   audio_upload_samples();
++   /* Maintain the resampler history while the frontend is muted. */
++   if (enabled & 2)
++      audio_upload_samples();
++   else
++      audio_out_buffer_pos = 0;
+ 
+    /* Apply any 'pending' rumble effects */
+    if (rumble_active)
