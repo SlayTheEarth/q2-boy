@@ -414,20 +414,43 @@ bool cover_hit(const char *directory, const char *fallback, const char *name,
            y >= top && y < top + height;
 }
 
+static void cover_span(const Cover *cover, CoverPose pose, int *start, int *end) {
+    float half = cover->width * 0.5f;
+    float left = CAMERA_DEPTH * (pose.x - half * pose.cosine) / (pose.depth + half * pose.sine);
+    float right = CAMERA_DEPTH * (pose.x + half * pose.cosine) / (pose.depth - half * pose.sine);
+    float center = WIDTH / 2.0f;
+    *start = (int)(center + (pose.mirrored ? -right : left));
+    *end = (int)(center + (pose.mirrored ? -left : right) + 0.5f);
+    if (*start < 0) *start = 0;
+    if (*end > WIDTH) *end = WIDTH;
+}
+
+bool cover_badge_position(const char *directory, const char *fallback, const char *name,
+                          enum CartridgeSystem system, float distance, int size, int *x, int *y) {
+    if (fabsf(distance) >= COVER_REACH) return false;
+    const Cover *cover = find_cover(directory, fallback, name, system);
+    CoverPose pose = cover_pose(distance);
+    int start, end, height;
+    unsigned source;
+    cover_span(cover, pose, &start, &end);
+    if (end <= start) return false;
+    int anchor = end - (end - start > size + 6 ? 4 : 0);
+    int sample = anchor - 1;
+    while (sample >= start && !cover_column(cover, pose, sample, &source, y, &height)) --sample;
+    if (sample < start) return false;
+    *x = anchor - size;
+    if (*x < 0) *x = 0;
+    *y += 4;
+    return true;
+}
+
 void cover_draw(uint32_t *canvas, const char *directory, const char *fallback, const char *name,
                 enum CartridgeSystem system, float distance, int offset_y) {
     if (fabsf(distance) >= COVER_REACH) return;
     const Cover *cover = find_cover(directory, fallback, name, system);
     CoverPose pose = cover_pose(distance);
-    float half = cover->width * 0.5f;
-    float left = CAMERA_DEPTH * (pose.x - half * pose.cosine) / (pose.depth + half * pose.sine);
-    float right = CAMERA_DEPTH * (pose.x + half * pose.cosine) / (pose.depth - half * pose.sine);
-    float center = WIDTH / 2.0f;
-    int start = (int)(center + (pose.mirrored ? -right : left));
-    int end = (int)(center + (pose.mirrored ? -left : right) + 0.5f);
-    if (start < 0) start = 0;
-    if (end > WIDTH) end = WIDTH;
-
+    int start, end;
+    cover_span(cover, pose, &start, &end);
     for (int x = start; x < end; ++x) {
         unsigned source_x;
         int top, height;

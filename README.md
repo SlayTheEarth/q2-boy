@@ -49,12 +49,14 @@ remain, Pocket Boy can still read them from the flat folders.
 
 ## ROM library and artwork
 
-Pocket Boy opens in **Cover Flow**. Press **Return** or swipe up to go to the
-previous system. Press **Play/Pause** or swipe down to go to the next system.
-The order is Game Boy, Game Boy Color, Game Boy Advance, NES, and SNES.
-Navigation wraps at both ends and skips empty systems. A marker on the
-right shows the current shelf. Pocket Boy opens on the last played system,
-or the first available system on a fresh install, starting with Game Boy.
+Pocket Boy opens on **Recently Played**, with up to ten games in launch order,
+newest first. Press **Return** or swipe up to go to the previous carousel.
+Press **Play/Pause** or swipe down to go to the next one. The console carousels
+follow Recently Played, and **Favorites** comes last. Navigation wraps and
+skips empty console shelves. The centered footer identifies the current shelf.
+
+Tap the heart on the centered cover or beside a title in List view to toggle
+its favorite status. A white outline means unpinned and a red heart means pinned.
 
 Turn the wheel, swipe horizontally, or use Previous and Next to browse games
 within a shelf. Tap a side cover to select it. Press Centre or tap the center
@@ -70,9 +72,19 @@ up to 2048, with an 8 MiB file limit. Covers keep their proportions. Games
 without readable artwork get a cartridge icon.
 
 Open **Sort** to choose **Title (A–Z)** or **Last played** within each system.
-Last played tracks successful launches and lists unplayed games alphabetically
-at the end. The same menu offers **List view** and **Refresh ROMs and covers**.
-Pocket Boy remembers the sort and view on the SD card.
+The sort also applies across Favorites. Last played tracks successful launches
+and lists unplayed games alphabetically at the end. The same menu offers
+**Consoles: List view** and **Refresh ROMs and covers**. Recently Played and
+Favorites always use Cover Flow. Pocket Boy remembers favorites, sort, and
+view on the SD card.
+
+## Pocket Boy menu
+
+Open **Menu** at the top of the library to set the default launch behavior,
+change the picture mode and filter, or copy a control layout between systems.
+**Launch: Start normally** is the default. **Launch: Resume latest save state**
+loads the newest compatible manual state from any of the game's ten slots,
+or starts normally when there is no compatible state.
 
 ## Picture scaling
 
@@ -107,6 +119,11 @@ with the default Fit setting.
   and use **Assign action** to remap a gameplay overlay. Menu remains
   available so there's always a way back.
 - **Reset controls** restores the default layout and assignments.
+
+Each console saves its own touch and physical controls. Existing layouts
+are inherited on first use. To reuse a layout, open **Menu → Copy control
+layout** in the library, choose the console to update, then choose the source.
+The copy applies to shared controls and preserves console-specific bindings.
 
 The emulator menu puts the fast-forward toggle beside its speed setting.
 **ROM library** keeps the current cartridge running at normal speed in the

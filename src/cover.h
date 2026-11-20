@@ -15,5 +15,7 @@ void cover_draw(uint32_t *canvas, const char *directory, const char *fallback, c
                 enum CartridgeSystem system, float distance, int offset_y);
 bool cover_hit(const char *directory, const char *fallback, const char *name, enum CartridgeSystem system,
                float distance, int x, int y);
+bool cover_badge_position(const char *directory, const char *fallback, const char *name,
+                          enum CartridgeSystem system, float distance, int size, int *x, int *y);
 
 #endif

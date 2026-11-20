@@ -6,6 +6,7 @@
 #include "font.h"
 #include <dirent.h>
 #include <errno.h>
+#include <math.h>
 #include <stdarg.h>
 #include <stddef.h>
 #include <stdbool.h>
@@ -33,7 +34,10 @@
 #define GRAY RGB(0xa6b9bb)
 #define DARK RGB(0x0c161a)
 
-enum Screen { BROWSER, GAME, MENU, STATES, SETTINGS, EDIT, CONFIRM, AUDIO, PHYSICAL, TOUCH, ASSIGN, BROWSER_OPTIONS };
+enum Screen {
+    BROWSER, GAME, MENU, STATES, SETTINGS, EDIT, CONFIRM, AUDIO, PHYSICAL, TOUCH, ASSIGN,
+    BROWSER_OPTIONS, APP_MENU, COPY_TARGET, COPY_SOURCE
+};
 enum Scale { FIT, CROP, STRETCH, INTEGER_SCALE, SCALE_COUNT };
 enum VideoFilter { NEAREST, SHARP_BILINEAR };
 enum Control { L, R, B, MENU_BUTTON, SPEED, QUICK_SAVE, QUICK_LOAD, AB, SELECT_BUTTON, START_BUTTON, TOUCH_A, TOUCH_UP, TOUCH_DOWN, TOUCH_LEFT, TOUCH_RIGHT, TOUCH_X, TOUCH_Y, CONTROLS };
@@ -42,6 +46,7 @@ typedef struct { int x, y, size, opacity, visible; unsigned keys; const char *la
 
 #define EDGE_INSET 12
 #define VERTICAL_INSET 5
+#define TOUCH_HIT_PADDING 12
 #define DEFAULT_OPACITY 70
 static const Button defaults[CONTROLS] = {
     {29, 5, 72, DEFAULT_OPACITY, 1, KEY(L), "L"},
@@ -124,6 +129,10 @@ static uint64_t next_video;
 #define FAST_DISPLAY_NS 33333333ull
 static double measured_speed;
 static Button buttons[CONTROLS];
+typedef struct { Button overlays[CONTROLS]; unsigned physical[PHYSICAL_COUNT]; } ControlProfile;
+static ControlProfile inherited_controls, control_profiles[SYSTEM_COUNT];
+static enum CartridgeSystem copy_target;
+static bool resume_latest;
 static enum Screen screen = BROWSER, confirm_from;
 static enum Scale scaling;
 static enum VideoFilter video_filter = SHARP_BILINEAR;
@@ -141,7 +150,10 @@ static char active_rom[PATH_CAP];
 enum RomSort { SORT_TITLE, SORT_RECENT, SORT_COUNT };
 static const char *const sort_labels[] = {"Title (A-Z)", "Last played"};
 static const char *const sort_short[] = {"A-Z", "Recent"};
-static const char *const system_names[] = {"Game Boy", "Game Boy Color", "Game Boy Advance", "NES", "SNES"};
+enum { FAVORITES = SYSTEM_COUNT, RECENT, SHELF_COUNT, RECENT_LIMIT = 10 };
+static const char *const shelf_names[SHELF_COUNT] = {
+    "Game Boy", "Game Boy Color", "Game Boy Advance", "NES", "SNES", "Favorites", "Recently Played"
+};
 static const char *const system_short[] = {"GB", "GBC", "GBA", "NES", "SNES"};
 static enum CartridgeSystem active_system = SYSTEM_GBA;
 typedef struct {
@@ -153,13 +165,15 @@ typedef struct {
 typedef struct { int first, end, selected; } RomShelf;
 typedef char RomName[sizeof ((Rom *)0)->name];
 static Rom roms[ROM_LIMIT];
-static RomShelf shelves[SYSTEM_COUNT], *shelf = &shelves[SYSTEM_GB], *previous_shelf;
+static RomShelf shelves[SHELF_COUNT], *shelf = &shelves[RECENT], *previous_shelf;
+static RomName favorite_names[ROM_LIMIT];
+static int favorite_count, favorite_roms[ROM_LIMIT], recent_roms[RECENT_LIMIT];
 static int rom_count, recent_count;
 static struct {
     unsigned char version, sort, list;
     char recent[ROM_LIMIT][256];
 } library;
-static char library_file[PATH_CAP];
+static char library_file[PATH_CAP], favorites_file[PATH_CAP];
 static float flow_position, flow_start, flow_drag_origin;
 static uint64_t flow_started, flow_draw_at, title_since, system_slide_started;
 static bool touching_flow;
@@ -169,6 +183,11 @@ static int flow_down_x, flow_down_y, system_slide_direction, system_slide_offset
 #define BROWSER_BUTTON_Y 12
 #define EXIT_X 36
 #define EXIT_W 84
+#define APP_MENU_X 126
+#define APP_MENU_W 103
+#define HEART_TARGET 32
+#define HEART_ICON 18
+#define LIST_HEART_X (WIDTH - 64)
 #define SORT_X 235
 #define SORT_W 103
 #define FLOW_FOOT_Y 272
@@ -280,16 +299,20 @@ static int button_height(int which, const Button *b) {
 static int button_radius(int which, const Button *b) {
     return which == B ? b->size / 2 : 8;
 }
-static void move_button(int which, int x, int y) {
-    Button *b = &buttons[which];
+static void place_button(int which, Button *b, int x, int y) {
     b->x = clamp(x, EDGE_INSET, WIDTH - EDGE_INSET - b->size);
     b->y = clamp(y, VERTICAL_INSET, HEIGHT - VERTICAL_INSET - button_height(which, b));
 }
-static bool inside_shape(int x, int y, int w, int h, int radius) {
-    if (x < 0 || y < 0 || x >= w || y >= h) return false;
+static void move_button(int which, int x, int y) { place_button(which, &buttons[which], x, y); }
+/* Outside the rounded rectangle's inner box, measure from its nearest point. */
+static int shape_distance_squared(int x, int y, int w, int h, int radius) {
     int dx = x < radius ? radius - 1 - x : x >= w - radius ? x - (w - radius) : 0;
     int dy = y < radius ? radius - 1 - y : y >= h - radius ? y - (h - radius) : 0;
-    return dx * dx + dy * dy < radius * radius;
+    return dx * dx + dy * dy;
+}
+static bool inside_shape(int x, int y, int w, int h, int radius) {
+    if (x < 0 || y < 0 || x >= w || y >= h) return false;
+    return shape_distance_squared(x, y, w, h, radius) < radius * radius;
 }
 static void status(const char *message) {
     snprintf(notice, sizeof notice, "%s", message);
@@ -302,16 +325,28 @@ static void rect(int x, int y, int w, int h, uint32_t fill) {
     for (int row = top; row < bottom; ++row)
         for (int col = left; col < right; ++col) canvas[row * WIDTH + col] = fill;
 }
+static inline uint32_t blend_video(uint32_t a, uint32_t b, unsigned weight);
+static void draw_mask(int x, int y, int width, int height, const void *mask_bytes,
+                      uint32_t ink, int left, int right) {
+    const unsigned char *mask = mask_bytes;
+    const int stride = (width + 1) / 2;
+    int first_col = clamp(left - x, 0, width), end_col = clamp(right - x, 0, width);
+    int first_row = clamp(-y, 0, height), end_row = clamp(HEIGHT - y, 0, height);
+    for (int row = first_row; row < end_row; ++row) {
+        for (int col = first_col; col < end_col; ++col) {
+            unsigned alpha = (mask[row * stride + col / 2] >> (4 * (col % 2))) & 15u;
+            if (!alpha) continue;
+            uint32_t *pixel = &canvas[(y + row) * WIDTH + x + col];
+            *pixel = alpha == 15 ? ink : blend_video(*pixel, ink, alpha * 17);
+        }
+    }
+}
 static void text_at(int x, int y, const char *value, uint32_t ink, int limit) {
     for (; *value; ++value) {
         unsigned ch = (unsigned char)*value;
         unsigned a = ch < 32 || ch > 126 ? '?' - 32 : ch - 32;
         if (x + advance[a] > limit) break;
-        for (int row = 0; row < 17; ++row)
-            for (int col = 0; col < 12; ++col)
-                if ((glyphs[a][row] >> col & 1u) && x + col >= 0 && x + col < WIDTH &&
-                    y + row >= 0 && y + row < HEIGHT)
-                    canvas[(y + row) * WIDTH + x + col] = ink;
+        draw_mask(x, y, 16, 17, &glyphs[a], ink, 0, WIDTH);
         x += advance[a];
     }
 }
@@ -340,11 +375,34 @@ static void put_button(int which, const char *label) {
     text_at(b->x + (b->size - label_width) / 2, b->y + (h - 17) / 2,
             label, WHITE, b->x + b->size);
 }
+static bool supports_action(enum CartridgeSystem system, unsigned keys) {
+    if (system != SYSTEM_SNES && (keys & (KEY(X) | KEY(Y)))) return false;
+    return system == SYSTEM_GBA || system == SYSTEM_SNES || !(keys & (KEY(L) | KEY(R)));
+}
+static bool supports_overlay(enum CartridgeSystem system, int index) {
+    return (index < TOUCH_X || system == SYSTEM_SNES) &&
+           supports_action(system, defaults[index].keys);
+}
 static bool overlay_visible(int index) {
     const Button *button = &buttons[index];
     if (!button->visible) return false;
-    if (active_system != SYSTEM_SNES && (index >= TOUCH_X || (button->keys & (KEY(X) | KEY(Y))))) return false;
-    return active_system != SYSTEM_NES || !(button->keys & (KEY(L) | KEY(R)));
+    return (index < TOUCH_X || active_system == SYSTEM_SNES) &&
+           supports_action(active_system, button->keys);
+}
+static int control_choices(bool touch, int choices[CONTROLS]) {
+    int count = 0;
+    if (touch) {
+        for (unsigned i = 0; i < sizeof touch_choices / sizeof touch_choices[0]; ++i) {
+            int id = touch_choices[i];
+            if (supports_overlay(active_system, id) ||
+                ((id == L || id == R) && supports_action(active_system, buttons[id].keys)))
+                choices[count++] = id;
+        }
+    } else {
+        for (unsigned i = 0; i < sizeof actions / sizeof actions[0]; ++i)
+            if (supports_action(active_system, actions[i].keys)) choices[count++] = i;
+    }
+    return count;
 }
 
 typedef struct { int x, y, width, height; } Picture;
@@ -570,20 +628,43 @@ static int write_overlay(char *buffer, size_t remaining, const Button *b) {
                     b->x, b->y, b->size, b->opacity, b->visible, b->keys);
 }
 
-static void store_config(void) {
+static bool write_config(const char *path, const ControlProfile *profile) {
     char buffer[768];
-    int used = snprintf(buffer, sizeof buffer, "%d 9 %d %d %d\n",
-                        scaling, fast_rate, local_volume, video_filter);
+    int used = snprintf(buffer, sizeof buffer, "%d 9 %d %d %d %d\n",
+                        scaling, fast_rate, local_volume, video_filter, resume_latest);
     for (int i = 0; i < TOUCH_X; ++i)
-        used += write_overlay(buffer + used, sizeof buffer - used, &buttons[i]);
+        used += write_overlay(buffer + used, sizeof buffer - used, &profile->overlays[i]);
     for (int i = 0; i < PHYSICAL_COUNT; ++i)
-        used += snprintf(buffer + used, sizeof buffer - used, "%u\n", physical_map[i]);
-    /* Keep the older layout intact when reverting to a previous build. */
+        used += snprintf(buffer + used, sizeof buffer - used, "%u\n", profile->physical[i]);
     for (int i = TOUCH_X; i < CONTROLS; ++i)
-        used += write_overlay(buffer + used, sizeof buffer - used, &buttons[i]);
-    if (!file_write(config_file, buffer, used)) status("Could not save overlay settings");
+        used += write_overlay(buffer + used, sizeof buffer - used, &profile->overlays[i]);
+    return file_write(path, buffer, used);
 }
-static bool read_overlay(FILE *f, int version, int row) {
+static void store_config(void) {
+    if (!write_config(config_file, &inherited_controls)) status("Could not save app settings");
+}
+static bool controls_path(char path[PATH_CAP], enum CartridgeSystem system) {
+    char name[32];
+    snprintf(name, sizeof name, "controls-%s.cfg", system_short[system]);
+    return join_path(path, data_dir, name);
+}
+static bool write_controls(enum CartridgeSystem system, const ControlProfile *profile) {
+    char path[PATH_CAP];
+    if (controls_path(path, system) && write_config(path, profile)) return true;
+    status("Could not save control layout");
+    return false;
+}
+static void activate_controls(enum CartridgeSystem system) {
+    memcpy(buttons, control_profiles[system].overlays, sizeof buttons);
+    memcpy(physical_map, control_profiles[system].physical, sizeof physical_map);
+}
+static void store_controls(void) {
+    ControlProfile *profile = &control_profiles[active_system];
+    memcpy(profile->overlays, buttons, sizeof buttons);
+    memcpy(profile->physical, physical_map, sizeof physical_map);
+    (void)write_controls(active_system, profile);
+}
+static bool read_overlay(FILE *f, int version, int row, ControlProfile *profile) {
     char line[80];
     int x, y, size, alpha, show;
     unsigned keys = 0;
@@ -592,7 +673,7 @@ static bool read_overlay(FILE *f, int version, int row) {
         return false;
     int which = version < 3 ? previous_overlays[row] : row;
     if (which < 0) return true;
-    Button *b = &buttons[which];
+    Button *b = &profile->overlays[which];
     if (version < 2) {
         const int *old = legacy_geometry[row];
         if (x == old[0] && y == old[1]) { x = b->x; y = b->y; }
@@ -614,42 +695,71 @@ static bool read_overlay(FILE *f, int version, int row) {
         x = b->x;
     }
     b->size = clamp(size, 36, 88);
-    move_button(which, x, y);
+    place_button(which, b, x, y);
     b->opacity = clamp(alpha, 16, 100);
     b->visible = which == MENU_BUTTON || show != 0;
     if (version >= 6 && remappable_overlay(which) && valid_action(keys)) b->keys = keys;
     return true;
 }
-static void load_config(void) {
-    memcpy(buttons, defaults, sizeof buttons);
-    memcpy(physical_map, physical_defaults, sizeof physical_map);
-    FILE *f = fopen(config_file, "r");
-    int saved_scale = FIT, version = 1, rate = 2, volume = 100, saved_filter = SHARP_BILINEAR;
+static void read_config(const char *path, ControlProfile *profile, bool app_settings) {
+    FILE *f = fopen(path, "r");
+    int saved_scale = FIT, version = 1, rate = 2, volume = 100, saved_filter = SHARP_BILINEAR, resume = 0;
     char line[80];
     if (!f) return;
     if (fgets(line, sizeof line, f))
-        sscanf(line, "%d %d %d %d %d", &saved_scale, &version, &rate, &volume, &saved_filter);
-    local_volume = clamp(volume, 0, 100);
-    platform_audio_attenuation(local_volume);
-    if (saved_scale >= FIT && saved_scale < SCALE_COUNT) scaling = saved_scale;
-    video_filter = saved_filter == NEAREST ? NEAREST : SHARP_BILINEAR;
-    if (rate == 2 || rate == 3 || rate == 5) fast_rate = rate == 5 ? 3 : rate;
+        sscanf(line, "%d %d %d %d %d %d", &saved_scale, &version, &rate, &volume, &saved_filter, &resume);
+    if (app_settings) {
+        local_volume = clamp(volume, 0, 100);
+        platform_audio_attenuation(local_volume);
+        if (saved_scale >= FIT && saved_scale < SCALE_COUNT) scaling = saved_scale;
+        video_filter = saved_filter == NEAREST ? NEAREST : SHARP_BILINEAR;
+        if (rate == 2 || rate == 3 || rate == 5) fast_rate = rate == 5 ? 3 : rate;
+        resume_latest = resume == 1;
+    }
     int rows = version < 3 ? (int)(sizeof previous_overlays / sizeof previous_overlays[0]) :
                version < 6 ? TOUCH_A : TOUCH_X;
     for (int row = 0; row < rows; ++row)
-        if (!read_overlay(f, version, row)) break;
+        if (!read_overlay(f, version, row, profile)) break;
     if (version >= 6) {
         for (int i = 0; i < PHYSICAL_COUNT; ++i) {
             unsigned keys;
             if (!fgets(line, sizeof line, f)) break;
-            if (sscanf(line, "%u", &keys) == 1 && valid_action(keys)) physical_map[i] = keys;
+            if (sscanf(line, "%u", &keys) == 1 && valid_action(keys)) profile->physical[i] = keys;
         }
     }
     if (version >= 9) {
         for (int row = TOUCH_X; row < CONTROLS; ++row)
-            if (!read_overlay(f, version, row)) break;
+            if (!read_overlay(f, version, row, profile)) break;
     }
     fclose(f);
+}
+static void load_config(void) {
+    memcpy(inherited_controls.overlays, defaults, sizeof buttons);
+    memcpy(inherited_controls.physical, physical_defaults, sizeof physical_map);
+    read_config(config_file, &inherited_controls, true);
+    for (int system = 0; system < SYSTEM_COUNT; ++system) {
+        char path[PATH_CAP];
+        control_profiles[system] = inherited_controls;
+        if (controls_path(path, system)) read_config(path, &control_profiles[system], false);
+    }
+    activate_controls(active_system);
+}
+static void copy_controls(enum CartridgeSystem source, enum CartridgeSystem target) {
+    const ControlProfile *from = &control_profiles[source];
+    ControlProfile next = control_profiles[target];
+    for (int i = 0; i < CONTROLS; ++i) {
+        if (supports_overlay(source, i) && supports_overlay(target, i) &&
+            supports_action(source, next.overlays[i].keys) && supports_action(target, from->overlays[i].keys))
+            next.overlays[i] = from->overlays[i];
+    }
+    for (int i = 0; i < PHYSICAL_COUNT; ++i) {
+        if (supports_action(source, next.physical[i]) && supports_action(target, from->physical[i]))
+            next.physical[i] = from->physical[i];
+    }
+    if (!write_controls(target, &next)) return;
+    control_profiles[target] = next;
+    if (target == active_system) activate_controls(target);
+    status("Shared controls copied");
 }
 static bool save_path(char path[PATH_CAP], const char *suffix, bool writing) {
     if (!file_path(path, PATH_CAP, game_base, suffix)) return false;
@@ -664,10 +774,13 @@ static bool state_path(char path[PATH_CAP], int number, bool writing) {
     snprintf(extension, sizeof extension, ".state%02d", number + 1);
     return save_path(path, extension, writing);
 }
-static bool state_info(int number, time_t *when) {
-    struct stat st;
+static bool state_stat(int number, struct stat64 *st) {
     char path[PATH_CAP];
-    if (!state_path(path, number, false) || stat(path, &st) != 0 || !S_ISREG(st.st_mode)) return false;
+    return state_path(path, number, false) && !stat64(path, st) && S_ISREG(st->st_mode);
+}
+static bool state_info(int number, time_t *when) {
+    struct stat64 st;
+    if (!state_stat(number, &st)) return false;
     if (when) *when = st.st_mtime;
     return true;
 }
@@ -695,8 +808,14 @@ static bool state_io(enum Action action, int number) {
     void *data = malloc(length);
     if (!data) return false;
     bool ok = false;
-    if (action == SAVE) ok = core->serialize(data, length) && file_write(path, data, length);
-    else {
+    if (action == SAVE) {
+        ok = core->serialize(data, length) && file_write(path, data, length);
+        if (ok && save_path(path, ".latest-state", true)) {
+            unsigned char last_saved = number;
+            if (!file_write(path, &last_saved, sizeof last_saved))
+                fprintf(stderr, "Could not record latest save slot\n");
+        }
+    } else {
         FILE *f = fopen(path, "rb");
         if (f) {
             ok = fread(data, 1, length, f) == length && fgetc(f) == EOF && !ferror(f);
@@ -706,6 +825,33 @@ static bool state_io(enum Action action, int number) {
     }
     free(data);
     return ok;
+}
+static int latest_state(void) {
+    size_t bytes = core->serialize_size();
+    if (!bytes) return -1;
+    struct timespec latest = {0};
+    int newest = -1;
+    int last_saved = -1;
+    char path[PATH_CAP];
+    if (save_path(path, ".latest-state", false)) {
+        FILE *file = fopen(path, "rb");
+        if (file) {
+            last_saved = fgetc(file);
+            fclose(file);
+        }
+    }
+    for (int i = 0; i < SLOTS; ++i) {
+        struct stat64 st;
+        if (!state_stat(i, &st) || st.st_size != (off64_t)bytes) continue;
+        bool later = st.st_mtime > latest.tv_sec ||
+                     (st.st_mtime == latest.tv_sec && st.st_mtim.tv_nsec > latest.tv_nsec);
+        bool tied = st.st_mtime == latest.tv_sec && st.st_mtim.tv_nsec == latest.tv_nsec;
+        if (newest < 0 || later || (tied && (i == last_saved || newest != last_saved))) {
+            latest = st.st_mtim;
+            newest = i;
+        }
+    }
+    return newest;
 }
 static void set_screen(enum Screen next) {
     if (!smoke && running && (screen == GAME || next == GAME)) platform_audio_reset();
@@ -755,7 +901,8 @@ static void set_fast(void) {
     dirty = 1;
 }
 static bool emulation_active(void) {
-    return running && (screen == GAME || screen == BROWSER || screen == BROWSER_OPTIONS);
+    return running && (screen == GAME || screen == BROWSER || screen == BROWSER_OPTIONS ||
+                       screen == APP_MENU || screen == COPY_TARGET || screen == COPY_SOURCE);
 }
 static void load_library(void) {
     FILE *file = fopen(library_file, "rb");
@@ -783,9 +930,25 @@ static void store_library(void) {
     if (!file_write(library_file, &library, length)) fprintf(stderr, "Could not save ROM library settings\n");
 }
 
-static int rom_compare(const void *left, const void *right) {
-    const Rom *a = left, *b = right;
-    if (a->system != b->system) return (int)a->system - (int)b->system;
+static void load_favorites(void) {
+    favorite_count = 0;
+    FILE *file = fopen(favorites_file, "rb");
+    if (!file) return;
+    RomName name;
+    while (favorite_count < ROM_LIMIT && fread(name, sizeof name, 1, file) == 1) {
+        if (memchr(name, 0, sizeof name) && rom_system(name) != SYSTEM_COUNT)
+            memcpy(favorite_names[favorite_count++], name, sizeof name);
+    }
+    fclose(file);
+}
+
+static int favorite_index(const char *name) {
+    for (int i = 0; i < favorite_count; ++i)
+        if (!strcmp(favorite_names[i], name)) return i;
+    return -1;
+}
+
+static int rom_order(const Rom *a, const Rom *b) {
     if (library.sort == SORT_RECENT && a->recent_rank != b->recent_rank)
         return a->recent_rank - b->recent_rank;
     int compare = strncasecmp(a->name, b->name, a->title_length < b->title_length
@@ -794,17 +957,38 @@ static int rom_compare(const void *left, const void *right) {
     return compare ? compare : strcmp(a->name, b->name);
 }
 
-static bool shelf_has_games(const RomShelf *page) { return page->first < page->end; }
+static int rom_compare(const void *left, const void *right) {
+    const Rom *a = left, *b = right;
+    if (a->system != b->system) return (int)a->system - (int)b->system;
+    return rom_order(a, b);
+}
 
-static void remember_highlights(RomName names[SYSTEM_COUNT]) {
-    for (int system = 0; system < SYSTEM_COUNT; ++system) {
-        const RomShelf *page = &shelves[system];
-        names[system][0] = 0;
-        if (shelf_has_games(page)) strcpy(names[system], roms[page->selected].name);
+static int favorite_compare(const void *left, const void *right) {
+    return rom_order(&roms[*(const int *)left], &roms[*(const int *)right]);
+}
+
+static const Rom *shelf_rom(const RomShelf *page, int index) {
+    if (page == &shelves[FAVORITES]) index = favorite_roms[index];
+    else if (page == &shelves[RECENT]) index = recent_roms[index];
+    return &roms[index];
+}
+
+static bool shelf_has_games(const RomShelf *page) { return page->first < page->end; }
+static bool shelf_is_console(const RomShelf *page) { return page - shelves < SYSTEM_COUNT; }
+static bool shelf_available(const RomShelf *page) {
+    return !shelf_is_console(page) || shelf_has_games(page);
+}
+static bool browser_list(void) { return library.list && shelf_is_console(shelf); }
+
+static void remember_highlights(RomName names[SHELF_COUNT]) {
+    for (int i = 0; i < SHELF_COUNT; ++i) {
+        const RomShelf *page = &shelves[i];
+        names[i][0] = 0;
+        if (shelf_has_games(page)) strcpy(names[i], shelf_rom(page, page->selected)->name);
     }
 }
 
-static void sort_library(RomName names[SYSTEM_COUNT]) {
+static void sort_library(RomName names[SHELF_COUNT]) {
     for (int i = 0; i < rom_count; ++i) {
         int rank = 0;
         while (rank < recent_count && strcmp(roms[i].name, library.recent[rank])) ++rank;
@@ -821,17 +1005,56 @@ static void sort_library(RomName names[SYSTEM_COUNT]) {
         }
         page->end = i;
     }
-    if (!shelf_has_games(shelf)) {
-        shelf = &shelves[SYSTEM_GB];
-        for (int system = 0; system < SYSTEM_COUNT && !shelf_has_games(shelf); ++system) {
-            if (shelf_has_games(&shelves[system])) shelf = &shelves[system];
+    RomShelf *favorites = &shelves[FAVORITES];
+    *favorites = (RomShelf){0};
+    for (i = 0; i < rom_count; ++i)
+        if (favorite_index(roms[i].name) >= 0) favorite_roms[favorites->end++] = i;
+    qsort(favorite_roms, favorites->end, sizeof favorite_roms[0], favorite_compare);
+    for (i = 0; i < favorites->end; ++i)
+        if (!strcmp(shelf_rom(favorites, i)->name, names[FAVORITES])) favorites->selected = i;
+    RomShelf *recent = &shelves[RECENT];
+    *recent = (RomShelf){0};
+    for (int rank = 0; rank < recent_count && recent->end < RECENT_LIMIT; ++rank) {
+        for (i = 0; i < rom_count; ++i) {
+            if (roms[i].recent_rank != rank) continue;
+            if (!strcmp(roms[i].name, names[RECENT])) recent->selected = recent->end;
+            recent_roms[recent->end++] = i;
+            break;
         }
     }
+    if (!shelf_available(shelf)) shelf = recent;
     flow_position = shelf->selected;
     flow_started = 0;
     previous_shelf = NULL;
     title_since = clock_ns();
     dirty = 1;
+}
+
+static void toggle_favorite(int row) {
+    const char *name = shelf_rom(shelf, row)->name;
+    int index = favorite_index(name);
+    int selection = row;
+    RomName selected[SHELF_COUNT];
+    remember_highlights(selected);
+    if (index >= 0) {
+        --favorite_count;
+        memmove(favorite_names + index, favorite_names + index + 1,
+                (favorite_count - index) * sizeof favorite_names[0]);
+    } else {
+        if (favorite_count == ROM_LIMIT) { status("Favorites is full"); return; }
+        memset(favorite_names[favorite_count], 0, sizeof favorite_names[0]);
+        strcpy(favorite_names[favorite_count++], name);
+    }
+    if (!file_write(favorites_file, favorite_names, favorite_count * sizeof favorite_names[0])) {
+        load_favorites();
+        status("Could not save Favorites");
+        return;
+    }
+    sort_library(selected);
+    if (shelf == &shelves[FAVORITES] && index >= 0 && shelf_has_games(shelf)) {
+        shelf->selected = clamp(selection, shelf->first, shelf->end - 1);
+        flow_position = shelf->selected;
+    }
 }
 
 static const char *rom_directory(const Rom *rom) {
@@ -867,15 +1090,8 @@ static void scan_rom_directory(const char *directory, enum CartridgeSystem expec
 }
 
 static void scan_roms(void) {
-    RomName selected[SYSTEM_COUNT];
+    RomName selected[SHELF_COUNT];
     remember_highlights(selected);
-    if (!rom_count && recent_count) {
-        enum CartridgeSystem system = rom_system(library.recent[0]);
-        if (system != SYSTEM_COUNT) {
-            shelf = &shelves[system];
-            strcpy(selected[system], library.recent[0]);
-        }
-    }
     rom_count = 0;
     cover_clear();
     for (int system = 0; system < SYSTEM_COUNT; ++system)
@@ -885,9 +1101,9 @@ static void scan_roms(void) {
 }
 
 static void remember_launch(void) {
-    RomName selected[SYSTEM_COUNT];
+    RomName selected[SHELF_COUNT];
     remember_highlights(selected);
-    int rank = roms[shelf->selected].recent_rank;
+    int rank = shelf_rom(shelf, shelf->selected)->recent_rank;
     if (!rank && recent_count) return;
     int move = clamp(rank, 0, ROM_LIMIT - 1);
     memmove(library.recent + 1, library.recent, move * sizeof library.recent[0]);
@@ -899,6 +1115,7 @@ static void remember_launch(void) {
 }
 
 static void close_rom(void);
+static void finish_rom(bool save);
 static bool load_rom(const char *path) {
     const char *name = strrchr(path, '/');
     name = name ? name + 1 : path;
@@ -962,6 +1179,7 @@ static bool load_rom(const char *path) {
     if (!smoke && av.timing.sample_rate >= 8000 && av.timing.sample_rate <= 192000)
         platform_audio_set_rate((unsigned)(av.timing.sample_rate + 0.5));
     active_system = system;
+    activate_controls(system);
     strcpy(game_base, base);
     strcpy(legacy_game_base, legacy_base);
     strcpy(active_rom, path);
@@ -980,7 +1198,7 @@ static void launch_selected(void) {
     char path[PATH_CAP];
     if (!shelf_has_games(shelf)) return;
     notice_end = 0;
-    const Rom *rom = &roms[shelf->selected];
+    const Rom *rom = shelf_rom(shelf, shelf->selected);
     if (!join_path(path, rom_directory(rom), rom->name)) return;
     if (running && !strcmp(active_rom, path)) { set_screen(GAME); return; }
 
@@ -996,7 +1214,19 @@ static void launch_selected(void) {
         }
         strcpy(previous, active_rom);
     }
-    if (load_rom(path)) {
+    bool loaded = load_rom(path);
+    if (loaded && resume_latest) {
+        int newest = latest_state();
+        if (newest >= 0) {
+            if (state_io(LOAD, newest)) slot = newest;
+            else {
+                finish_rom(false);
+                loaded = load_rom(path);
+                if (loaded) status("Save state unreadable. Started normally.");
+            }
+        }
+    }
+    if (loaded) {
         remember_launch();
     } else {
         if (!running && snapshot && load_rom(previous)) {
@@ -1011,10 +1241,10 @@ static void launch_selected(void) {
     }
     free(snapshot);
 }
-static void close_rom(void) {
+static void finish_rom(bool save) {
     if (running) {
         launch_stage = 5;
-        cartridge_saves(true);
+        if (save) cartridge_saves(true);
         core->unload_game();
     }
     launch_stage = 0;
@@ -1024,7 +1254,14 @@ static void close_rom(void) {
     fast = 0;
     if (!smoke) platform_audio_reset();
 }
+static void close_rom(void) { finish_rom(true); }
 typedef struct { int x, y, w, h; bool enabled; char label[96]; } MenuItem;
+static const char *const picture_modes[SCALE_COUNT] = {
+    "Original aspect", "Crop to fill", "Stretch to fill", "Integer Scale"
+};
+static const char *filter_label(void) {
+    return video_filter == SHARP_BILINEAR ? "Filter: Sharp Bilinear" : "Filter: Nearest";
+}
 
 static int menu_items(MenuItem *items) {
     int count = 0;
@@ -1035,12 +1272,28 @@ static int menu_items(MenuItem *items) {
     snprintf(m->label, sizeof m->label, "%s", (label_)); \
 } while (0)
     switch (screen) {
+    case APP_MENU:
+        ITEM(15, 52, 345, 40, resume_latest ? "Launch: Resume latest save state" : "Launch: Start normally", true);
+        snprintf(label, sizeof label, "Picture: %s", picture_modes[scaling]);
+        ITEM(15, 95, 345, 40, label, true);
+        ITEM(15, 138, 345, 40, filter_label(), true);
+        ITEM(15, 181, 345, 40, "Copy control layout", true);
+        ITEM(15, 267, 345, 40, "Back", true);
+        break;
+    case COPY_TARGET: case COPY_SOURCE:
+        for (int system = 0; system < SYSTEM_COUNT; ++system) {
+            if (screen == COPY_SOURCE && system == (int)copy_target) continue;
+            int y = 51 + count * 42;
+            ITEM(15, y, 345, 39, shelf_names[system], true);
+        }
+        ITEM(15, 267, 345, 40, "Back", true);
+        break;
     case BROWSER_OPTIONS:
         for (int i = 0; i < SORT_COUNT; ++i) {
             snprintf(label, sizeof label, "%s%s", sort_labels[i], library.sort == i ? "  (current)" : "");
             ITEM(35, 52 + i * 43, 305, 39, label, true);
         }
-        ITEM(35, 138, 305, 39, library.list ? "Cover Flow" : "List view", true);
+        ITEM(35, 138, 305, 39, library.list ? "Consoles: Cover Flow" : "Consoles: List view", true);
         ITEM(35, 181, 305, 39, "Refresh ROMs and covers", true);
         break;
     case MENU:
@@ -1062,20 +1315,16 @@ static int menu_items(MenuItem *items) {
         ITEM(192, 163, 168, 57, "Load state", state_info(slot, NULL));
         ITEM(15, 235, 345, 51, "Back", true);
         break;
-    case SETTINGS: {
-        static const char *const modes[SCALE_COUNT] = {
-            "Original aspect", "Crop to fill", "Stretch to fill", "Integer Scale"
-        };
-        snprintf(label, sizeof label, "Picture: %s", modes[scaling]);
+    case SETTINGS:
+        snprintf(label, sizeof label, "Picture: %s", picture_modes[scaling]);
         ITEM(15, 50, 345, 40, label, true);
-        ITEM(15, 93, 345, 40, video_filter == SHARP_BILINEAR ? "Filter: Sharp Bilinear" : "Filter: Nearest", true);
+        ITEM(15, 93, 345, 40, filter_label(), true);
         ITEM(15, 136, 345, 40, "Physical buttons", true);
         ITEM(15, 179, 345, 40, "Touch buttons", true);
         ITEM(15, 222, 345, 40, "Move, resize, or fade buttons", true);
         ITEM(15, 267, 132, 40, "Back", true);
         ITEM(152, 267, 208, 40, "Reset controls", true);
         break;
-    }
     case PHYSICAL:
         for (int i = 0; i < PHYSICAL_COUNT; ++i) {
             snprintf(label, sizeof label, "%s: %s", physical_names[i], action_name(physical_map[i]));
@@ -1085,18 +1334,17 @@ static int menu_items(MenuItem *items) {
         break;
     case TOUCH:
     case ASSIGN: {
-        int page = screen == TOUCH ? touch_page : assign_page;
-        int total = screen == TOUCH ? (int)(sizeof touch_choices / sizeof touch_choices[0])
-                                    : (int)(sizeof actions / sizeof actions[0]);
-        if (active_system != SYSTEM_SNES) total -= 2;
+        bool touch = screen == TOUCH;
+        int page = touch ? touch_page : assign_page;
+        int choices[CONTROLS], total = control_choices(touch, choices);
         for (int i = 0; i < 6; ++i) {
             int k = page * 6 + i;
             if (k >= total) break;
-            if (screen == TOUCH) {
-                int id = touch_choices[k];
+            if (touch) {
+                int id = choices[k];
                 snprintf(label, sizeof label, "%s: %s", button_label(id, &buttons[id]),
                          buttons[id].visible ? "On" : "Off");
-            } else snprintf(label, sizeof label, "%s", actions[k].name);
+            } else snprintf(label, sizeof label, "%s", actions[choices[k]].name);
             ITEM(15 + (i % 2) * 175, 58 + (i / 2) * 60, 170, 51, label, true);
         }
         ITEM(15, 252, 110, 49, "Previous page", page > 0);
@@ -1162,42 +1410,61 @@ static void caption(int y, const char *label, uint32_t ink, int size, uint64_t n
     }
     for (; *label && x < WIDTH - CAPTION_EDGE; ++label) {
         int glyph = glyph_index((unsigned char)*label);
-        const uint32_t *rows = title ? glyphs_24[glyph] : glyphs_20[glyph];
-        for (int row = 0; row < h; ++row) {
-            for (int col = 0; col < 26; ++col) {
-                int pixel = x + col;
-                if (pixel >= CAPTION_EDGE && pixel < WIDTH - CAPTION_EDGE &&
-                    (unsigned)(y + row) < HEIGHT && (rows[row] >> col & 1u))
-                    canvas[(y + row) * WIDTH + pixel] = ink;
-            }
-        }
+        const void *mask = title ? (const void *)&glyphs_24[glyph] : &glyphs_20[glyph];
+        draw_mask(x, y, 26, h, mask, ink, CAPTION_EDGE, WIDTH - CAPTION_EDGE);
         x += widths[glyph];
     }
 }
 
-static void selected_title(int index, char title[256]) {
-    const Rom *rom = &roms[index];
+static void selected_title(const RomShelf *page, int index, char title[256]) {
+    const Rom *rom = shelf_rom(page, index);
     memcpy(title, rom->name, rom->title_length);
     title[rom->title_length] = 0;
 }
+static bool heart_position(const Rom *rom, float distance, int *x, int *y) {
+    return cover_badge_position(rom_directory(rom), rom->legacy ? NULL : data_paths.roms,
+                                rom->name, rom->system, distance, HEART_TARGET, x, y);
+}
+static void draw_heart(const Rom *rom, int x, int y) {
+    const bool filled = favorite_index(rom->name) >= 0;
+    rect(x + 4, y + 4, HEART_TARGET - 8, HEART_TARGET - 8, RGB(0x171717));
+    const int inset = (HEART_TARGET - HEART_ICON) / 2;
+    draw_mask(x + inset, y + inset, HEART_ICON, HEART_ICON, &heart_mask[filled],
+              filled ? RGB(0xff4848) : WHITE, 0, WIDTH);
+}
+static bool heart_hit(int x, int y, int left, int top) {
+    return x >= left && x < left + HEART_TARGET && y >= top && y < top + HEART_TARGET;
+}
 
 static void draw_shelf(const RomShelf *page, float position, int offset_y, uint64_t now) {
+    if (!shelf_has_games(page)) {
+        bool recent = page == &shelves[RECENT];
+        caption(111 + offset_y, recent ? "No recently played games" : "No favorites yet", WHITE, 24, 0);
+        const char *hint = rom_count ? (recent ? "Swipe down to browse your games."
+                                              : "Tap a game's heart to add it here.")
+                                    : "Copy ROMs to q2-boy/ROMs.";
+        text_at((WIDTH - text_width(hint, advance)) / 2, 154 + offset_y, hint, GRAY, WIDTH);
+        caption(282 + offset_y, shelf_names[page - shelves], GRAY, 20, 0);
+        return;
+    }
     int mid = (int)(position + 0.5f);
     int left = clamp(mid - 4, page->first, page->end - 1);
     int right = clamp(mid + 4, page->first, page->end - 1);
     /* Paint farther cards first so the active cover overlaps its neighbors. */
     while (left <= right) {
         int i = position - left > right - position ? left++ : right--;
-        const Rom *rom = &roms[i];
+        const Rom *rom = shelf_rom(page, i);
         cover_draw(canvas, rom_directory(rom), rom->legacy ? NULL : data_paths.roms,
                    rom->name, rom->system, i - position, offset_y);
     }
-    char title[256], sub[64];
-    selected_title(mid, title);
-    snprintf(sub, sizeof sub, "%s | %d of %d", system_names[page - shelves],
-             mid - page->first + 1, page->end - page->first);
+    const Rom *center = shelf_rom(page, mid);
+    int heart_x, heart_y;
+    if (heart_position(center, mid - position, &heart_x, &heart_y))
+        draw_heart(center, heart_x, heart_y + offset_y);
+    char title[256];
+    selected_title(page, mid, title);
     caption(254 + offset_y, title, RGB(0xffffff), 24, now);
-    caption(282 + offset_y, sub, RGB(0xaaaaaa), 20, now);
+    caption(282 + offset_y, shelf_names[page - shelves], RGB(0xaaaaaa), 20, now);
 }
 
 static void browser_button(int x, int y, int width, const char *label, bool enabled) {
@@ -1212,14 +1479,15 @@ static int list_first(void) {
 
 static void draw_system_indicator(void) {
     int count = 0;
-    for (int system = 0; system < SYSTEM_COUNT; ++system)
-        if (shelf_has_games(&shelves[system])) ++count;
+    for (int i = 0; i < SHELF_COUNT; ++i)
+        if (shelf_available(&shelves[i])) ++count;
     if (count < 2) return;
     int y = HEIGHT / 2 - (count - 1) * 12;
     const int x = WIDTH - 16;
-    for (int system = 0; system < SYSTEM_COUNT; ++system) {
-        if (!shelf_has_games(&shelves[system])) continue;
-        bool active = shelf == &shelves[system];
+    for (int i = 0; i < SHELF_COUNT; ++i) {
+        const RomShelf *page = &shelves[(RECENT + i) % SHELF_COUNT];
+        if (!shelf_available(page)) continue;
+        bool active = shelf == page;
         int half = active ? 7 : 3;
         rect(x - 4, y - half - 1, 8, 2 * half + 2, RGB(0x101010));
         rect(x - 2, y - half + 2, 4, 2 * half - 4, active ? WHITE : RGB(0x888888));
@@ -1230,18 +1498,15 @@ static void draw_system_indicator(void) {
 
 static void draw_browser(void) {
     rect(0, 0, WIDTH, HEIGHT, SHELF_INK);
-    if (!shelf_has_games(shelf)) {
-        caption(111, "No games found", WHITE, 24, 0);
-        const char *hint = "Copy ROMs to q2-boy/ROMs.";
-        text_at((WIDTH - text_width(hint, advance)) / 2, 154, hint, GRAY, WIDTH);
-    } else if (library.list) {
+    if (browser_list()) {
         int start = list_first();
         for (int i = start; i < shelf->end && i < start + ROWS; ++i) {
             int y = LIST_TOP + (i - start) * LIST_ROW;
             rect(28, y, WIDTH - 56, 39, i == shelf->selected ? RGB(0x393939) : RGB(0x181818));
             char title[256];
-            selected_title(i, title);
-            text_at(40, y + 11, title, WHITE, WIDTH - 40);
+            selected_title(shelf, i, title);
+            text_at(40, y + 11, title, WHITE, LIST_HEART_X - 5);
+            draw_heart(shelf_rom(shelf, i), LIST_HEART_X, y + 3);
         }
         browser_button(37, FLOW_FOOT_Y, 89, "Previous", start > shelf->first);
         browser_button(133, FLOW_FOOT_Y, 89, "Next", start + ROWS < shelf->end);
@@ -1260,10 +1525,11 @@ static void draw_browser(void) {
     snprintf(sort, sizeof sort, "Sort: %s", sort_short[library.sort]);
     browser_button(SORT_X, BROWSER_BUTTON_Y, SORT_W, sort, true);
     browser_button(EXIT_X, BROWSER_BUTTON_Y, EXIT_W, running ? "Resume" : "Exit", true);
+    browser_button(APP_MENU_X, BROWSER_BUTTON_Y, APP_MENU_W, "Menu", true);
 }
 
 static void update_browser(uint64_t now) {
-    if (screen != BROWSER || library.list || !shelf_has_games(shelf) || now < flow_draw_at) return;
+    if (screen != BROWSER || browser_list() || now < flow_draw_at) return;
     flow_draw_at = now + BROWSER_FRAME_NS;
     if (previous_shelf) {
         uint64_t elapsed = now >= system_slide_started ? now - system_slide_started : 0;
@@ -1286,9 +1552,9 @@ static void update_browser(uint64_t now) {
             flow_position = shelf->selected + (flow_start - shelf->selected) * remaining * remaining * remaining;
         }
         dirty = 1;
-    } else {
+    } else if (shelf_has_games(shelf)) {
         char title[256];
-        selected_title(shelf->selected, title);
+        selected_title(shelf, shelf->selected, title);
         if (text_width(title, advance_24) > WIDTH - CAPTION_EDGE * 2) dirty = 1;
     }
 }
@@ -1298,6 +1564,16 @@ static void draw_ui(void) {
     switch (screen) {
     case GAME: draw_game(); break;
     case BROWSER: draw_browser(); break;
+    case APP_MENU:
+        header("Pocket Boy", "Settings for all consoles");
+        break;
+    case COPY_TARGET:
+        header("Copy control layout", "Choose the console to update.");
+        break;
+    case COPY_SOURCE:
+        snprintf(sub, sizeof sub, "Copy shared controls to %s.", shelf_names[copy_target]);
+        header("Choose source console", sub);
+        break;
     case BROWSER_OPTIONS:
         header("Library options", "Use the wheel and Centre, or tap an option.");
         break;
@@ -1317,7 +1593,7 @@ static void draw_ui(void) {
         break;
     }
     case SETTINGS:
-        header("Display and controls", "Scroll and press Centre, or tap a setting.");
+        header("Display and controls", shelf_names[active_system]);
         break;
     case PHYSICAL:
         header("Physical buttons", "Choose a button to change its gameplay action.");
@@ -1369,19 +1645,35 @@ static void draw_ui(void) {
 }
 
 static int hit(int x, int y) {
+    if (x < 0 || y < 0 || x >= WIDTH || y >= HEIGHT) return -1;
+    int nearest = -1;
+    float best = TOUCH_HIT_PADDING;
     for (int i = CONTROLS - 1; i >= 0; --i) {
+        if (!overlay_visible(i)) continue;
         const Button *b = &buttons[i];
-        if (overlay_visible(i) && inside_shape(x - b->x, y - b->y, b->size,
-                                       button_height(i, b), button_radius(i, b))) return i;
+        int local_x = x - b->x, local_y = y - b->y;
+        int height = button_height(i, b), radius = button_radius(i, b);
+        int distance_squared = shape_distance_squared(local_x, local_y, b->size, height, radius);
+        if (distance_squared < radius * radius) return i;
+        int reach = radius + TOUCH_HIT_PADDING;
+        if (screen == GAME && distance_squared < reach * reach) {
+            float gap = sqrtf((float)distance_squared) - radius;
+            if (gap < best) {
+                best = gap;
+                nearest = i;
+            }
+        }
     }
-    return -1;
+    return nearest;
 }
 static bool within(int x, int y, int left, int top, int width) {
     return x >= left && x < left + width && y >= top && y < top + 38;
 }
 static void go_back(void) {
     switch (screen) {
-    case BROWSER_OPTIONS: set_screen(BROWSER); break;
+    case BROWSER_OPTIONS: case APP_MENU: set_screen(BROWSER); break;
+    case COPY_TARGET: set_screen(APP_MENU); break;
+    case COPY_SOURCE: set_screen(COPY_TARGET); break;
     case BROWSER:
         if (running) set_screen(GAME);
         else quitting = 1;
@@ -1389,7 +1681,7 @@ static void go_back(void) {
     case MENU: set_screen(GAME); break;
     case GAME: set_screen(MENU); break;
     case STATES: case SETTINGS: case AUDIO: set_screen(MENU); break;
-    case EDIT: dragging = -1; store_config(); set_screen(SETTINGS); break;
+    case EDIT: dragging = -1; store_controls(); set_screen(SETTINGS); break;
     case CONFIRM: set_screen(confirm_from); break;
     case PHYSICAL: case TOUCH: set_screen(SETTINGS); break;
     case ASSIGN: set_screen(assign_return); break;
@@ -1399,7 +1691,7 @@ static void slot_step(int step) { slot = (slot + step + SLOTS) % SLOTS; dirty = 
 static void pick_rom(int step) {
     if (!shelf_has_games(shelf)) return;
     shelf->selected = clamp(shelf->selected + step, shelf->first, shelf->end - 1);
-    if (library.list) flow_position = shelf->selected;
+    if (browser_list()) flow_position = shelf->selected;
     else {
         if (flow_position < shelf->selected - 2) flow_position = shelf->selected - 2;
         if (flow_position > shelf->selected + 2) flow_position = shelf->selected + 2;
@@ -1413,11 +1705,12 @@ static void pick_rom(int step) {
 
 static void pick_system(int direction) {
     int current = (int)(shelf - shelves);
-    for (int step = 1; step < SYSTEM_COUNT; ++step) {
-        int system = (current + step * direction + SYSTEM_COUNT) % SYSTEM_COUNT;
-        if (!shelf_has_games(&shelves[system])) continue;
-        previous_shelf = library.list ? NULL : shelf;
-        shelf = &shelves[system];
+    for (int step = 1; step < SHELF_COUNT; ++step) {
+        RomShelf *page = &shelves[(current + step * direction + SHELF_COUNT) % SHELF_COUNT];
+        if (!shelf_available(page)) continue;
+        bool animate = !browser_list() && (!library.list || !shelf_is_console(page));
+        previous_shelf = animate ? shelf : NULL;
+        shelf = page;
         flow_position = shelf->selected;
         flow_started = flow_draw_at = 0;
         wheel_delta = 0;
@@ -1435,9 +1728,29 @@ static void activate_menu(int index) {
     if (index < 0 || index >= count || !items[index].enabled) return;
     menu_focus = index;
     switch (screen) {
+    case APP_MENU:
+        if (index == 0) { resume_latest = !resume_latest; store_config(); }
+        else if (index == 1) { scaling = (scaling + 1) % SCALE_COUNT; store_config(); }
+        else if (index == 2) {
+            video_filter = video_filter == SHARP_BILINEAR ? NEAREST : SHARP_BILINEAR;
+            store_config();
+        } else if (index == 3) set_screen(COPY_TARGET);
+        else go_back();
+        break;
+    case COPY_TARGET:
+        if (index == SYSTEM_COUNT) go_back();
+        else { copy_target = index; set_screen(COPY_SOURCE); }
+        break;
+    case COPY_SOURCE:
+        if (index == SYSTEM_COUNT - 1) go_back();
+        else {
+            copy_controls(index + (index >= (int)copy_target), copy_target);
+            set_screen(COPY_TARGET);
+        }
+        break;
     case BROWSER_OPTIONS:
         if (index < SORT_COUNT) {
-            RomName selected[SYSTEM_COUNT];
+            RomName selected[SHELF_COUNT];
             remember_highlights(selected);
             library.sort = index;
             sort_library(selected);
@@ -1487,7 +1800,7 @@ static void activate_menu(int index) {
         else {
             memcpy(buttons, defaults, sizeof buttons);
             memcpy(physical_map, physical_defaults, sizeof physical_map);
-            store_config();
+            store_controls();
             status("Default controls restored");
         }
         break;
@@ -1503,11 +1816,13 @@ static void activate_menu(int index) {
             *page += index == count - 2 ? 1 : -1;
             menu_focus = 0;
         } else {
-            int k = *page * 6 + index;
-            if (touch) buttons[touch_choices[k]].visible ^= 1;
+            int choices[CONTROLS];
+            (void)control_choices(touch, choices);
+            int k = choices[*page * 6 + index];
+            if (touch) buttons[k].visible ^= 1;
             else if (assign_return == PHYSICAL) physical_map[assign_target] = actions[k].keys;
             else buttons[assign_target].keys = actions[k].keys;
-            store_config();
+            store_controls();
             if (!touch) go_back();
         }
         break;
@@ -1561,13 +1876,19 @@ static void step_menu(int step) {
 }
 static void tap_cover(int x, int y) {
     int mid = (int)(flow_position + 0.5f);
+    int heart_x, heart_y;
+    if (heart_position(shelf_rom(shelf, mid), mid - flow_position, &heart_x, &heart_y) &&
+        heart_hit(x, y, heart_x, heart_y)) {
+        toggle_favorite(mid);
+        return;
+    }
     int closest = -1;
     float best = COVER_REACH;
     for (int i = clamp(mid - 4, shelf->first, shelf->end - 1);
          i < shelf->end && i <= mid + 4; ++i) {
         float offset = i - flow_position;
         float distance = offset < 0 ? -offset : offset;
-        const Rom *rom = &roms[i];
+        const Rom *rom = shelf_rom(shelf, i);
         if (distance < best && cover_hit(rom_directory(rom), rom->legacy ? NULL : data_paths.roms,
                                         rom->name, rom->system, offset, x, y)) {
             closest = i;
@@ -1592,9 +1913,9 @@ static void browser_touch(char action, int x, int y) {
     if (!touching_flow) return;
     int dx = x - flow_down_x, dy = y - flow_down_y;
     if (flow_gesture == TOUCH_TAP && flow_down_y >= BROWSER_BUTTON_Y + 38 &&
-        shelf_has_games(shelf) && (abs(dx) >= 8 || abs(dy) >= 8)) {
+        (abs(dx) >= 8 || abs(dy) >= 8)) {
         if (abs(dy) > abs(dx)) flow_gesture = TOUCH_VERTICAL;
-        else if (!library.list) flow_gesture = TOUCH_HORIZONTAL;
+        else if (!browser_list() && shelf_has_games(shelf)) flow_gesture = TOUCH_HORIZONTAL;
     }
     if (flow_gesture == TOUCH_HORIZONTAL) {
         previous_shelf = NULL;
@@ -1619,15 +1940,16 @@ static void browser_touch(char action, int x, int y) {
         set_screen(BROWSER_OPTIONS);
         menu_focus = library.sort;
     } else if (within(x, y, EXIT_X, BROWSER_BUTTON_Y, EXIT_W)) go_back();
+    else if (within(x, y, APP_MENU_X, BROWSER_BUTTON_Y, APP_MENU_W)) set_screen(APP_MENU);
     else if (!shelf_has_games(shelf) || previous_shelf) return;
-    else if (!library.list && y >= BROWSER_BUTTON_Y + 38) tap_cover(x, y);
-    else if (library.list) {
+    else if (!browser_list() && y >= BROWSER_BUTTON_Y + 38) tap_cover(x, y);
+    else if (browser_list()) {
         int row = (y - LIST_TOP) / LIST_ROW;
         int index = list_first() + row;
         if (x >= 28 && x < WIDTH - 28 && y >= LIST_TOP && row < ROWS &&
             (y - LIST_TOP) % LIST_ROW < 39 && index < shelf->end) {
-            shelf->selected = index;
-            launch_selected();
+            if (heart_hit(x, y, LIST_HEART_X, LIST_TOP + row * LIST_ROW + 3)) toggle_favorite(index);
+            else { shelf->selected = index; launch_selected(); }
         } else if (within(x, y, 37, FLOW_FOOT_Y, 89)) pick_rom(-ROWS);
         else if (within(x, y, 133, FLOW_FOOT_Y, 89)) pick_rom(ROWS);
     }
@@ -1666,7 +1988,7 @@ static void read_touch(char action, int x, int y) {
     }
     case BROWSER: break; /* Handled above to distinguish taps from swipes. */
     case MENU: case STATES: case SETTINGS: case CONFIRM: case AUDIO: case PHYSICAL: case TOUCH:
-    case ASSIGN: case BROWSER_OPTIONS:
+    case ASSIGN: case BROWSER_OPTIONS: case APP_MENU: case COPY_TARGET: case COPY_SOURCE:
         tap_menu(x, y);
         break;
     case EDIT: {
@@ -1690,7 +2012,7 @@ static void read_wheel(int delta) {
     if (!wheel_time || now - wheel_time > 300000000ull) wheel_delta = 0;
     wheel_time = now;
     wheel_delta += clamp(delta, -84, 84);
-    int tick = screen == BROWSER && !library.list ? 38 : 21;
+    int tick = screen == BROWSER && !browser_list() ? 38 : 21;
     while (abs(wheel_delta) >= tick) {
         int step = wheel_delta < 0 ? 1 : -1;
         wheel_delta += step * tick;
@@ -1700,8 +2022,7 @@ static void read_wheel(int delta) {
 }
 static unsigned mapped_button(int id) {
     unsigned keys = physical_map[id];
-    if (active_system != SYSTEM_SNES && (keys & (KEY(X) | KEY(Y)))) return physical_defaults[id];
-    return keys;
+    return supports_action(active_system, keys) ? keys : physical_defaults[id];
 }
 
 static int decode_key(Event e) {
@@ -1745,12 +2066,12 @@ static void read_event(Event e) {
             if (screen == BROWSER) launch_selected();
             else activate_menu(menu_focus);
         } else if (screen == BROWSER) {
-            if (!library.list && (id == P_RETURN || id == P_PLAY))
+            if (!browser_list() && (id == P_RETURN || id == P_PLAY))
                 pick_system(id == P_PLAY ? 1 : -1);
             else if (id == P_RETURN) go_back();
             else if (id == P_PLAY) pick_rom(1);
-            else if (id == P_PREVIOUS) pick_rom(library.list ? -ROWS : -1);
-            else if (id == P_NEXT) pick_rom(library.list ? ROWS : 1);
+            else if (id == P_PREVIOUS) pick_rom(browser_list() ? -ROWS : -1);
+            else if (id == P_NEXT) pick_rom(browser_list() ? ROWS : 1);
         } else if (id == P_RETURN) go_back();
     } else {
         held_buttons &= ~bit;
@@ -1859,6 +2180,7 @@ static void initialize_core(const struct Core *selected) {
 static bool prepare_dirs(void) {
     return join_path(config_file, data_dir, "controls.cfg") &&
            join_path(library_file, data_dir, "library.cfg") &&
+           join_path(favorites_file, data_dir, "favorites.cfg") &&
            library_prepare(&data_paths, data_dir);
 }
 static int smoke_test(const char *path) {
@@ -1917,6 +2239,29 @@ static int smoke_test(const char *path) {
     }
     scaling = initial_scale;
     video_filter = initial_filter;
+    const Button *menu = &buttons[MENU_BUTTON];
+    int menu_x = menu->x + menu->size / 2, menu_y = menu->y - TOUCH_HIT_PADDING;
+    Button saved_b = buttons[B];
+    int menu_right = menu->x + menu->size;
+    int menu_center_y = menu->y + button_height(MENU_BUTTON, menu) / 2;
+    buttons[B].x = menu_right + TOUCH_HIT_PADDING;
+    buttons[B].y = menu_center_y - buttons[B].size / 2;
+    if (hit(menu_right + 2, menu_center_y) != MENU_BUTTON ||
+        hit(menu_right + 10, menu_center_y) != B) { close_rom(); return 34; }
+    buttons[B].x = menu_right + 6;
+    if (hit(menu_right + 7, menu_center_y) != B) { close_rom(); return 35; }
+    buttons[B] = saved_b;
+    int b_x = b->x - 6, b_y = b->y + b->size / 2;
+    read_touch('d', b_x, b_y);
+    if (touch_keys != KEY(B)) { close_rom(); return 36; }
+    read_touch('u', b_x, b_y);
+    pressed_this_frame = 0;
+    read_touch('d', menu_x, menu_y - 1);
+    if (screen != GAME) { close_rom(); return 32; }
+    read_touch('u', menu_x, menu_y - 1);
+    read_touch('d', menu_x, menu_y);
+    if (screen != MENU) { close_rom(); return 33; }
+    read_touch('u', menu_x, menu_y);
     set_screen(MENU);
     read_wheel(-21);
     read_event((Event){'g', 'd', 116, 0});
@@ -1956,8 +2301,10 @@ static int smoke_test(const char *path) {
     set_screen(TOUCH);
     touch_page = 0;
     activate_menu(0); /* Show A. */
-    activate_menu(7); /* Next page. */
-    activate_menu(0); /* Show Up. */
+    if (supports_overlay(active_system, L)) {
+        activate_menu(7); /* Next page. */
+        activate_menu(0); /* Show Up. */
+    } else activate_menu(4); /* Show Up on the first page. */
     edit_button = TOUCH_A;
     set_screen(EDIT);
     activate_menu(6); /* Assign action. */
@@ -2081,7 +2428,7 @@ static void log_launch(void) {
     sigaction(SIGSEGV, &action, NULL);
     sigaction(SIGABRT, &action, NULL);
     sigaction(SIGFPE, &action, NULL);
-    fprintf(stderr, "\nq2-boy 0.3.3, engine=%s\n",
+    fprintf(stderr, "\nq2-boy 0.3.4, engine=%s\n",
             use_dynarec ? "dynamic recompiler (opt-in)" : "interpreter");
     FILE *memory = fopen("/proc/meminfo", "r");
     if (memory) {
@@ -2132,6 +2479,7 @@ int main(int argc, char **argv) {
     }
     if (!raw_buttons && !native_supported) status("Limited input: holding Up may exit");
     load_library();
+    load_favorites();
     library_migrate(&data_paths);
     scan_roms();
     uint64_t next_frame = 0;
