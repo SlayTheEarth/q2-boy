@@ -61,9 +61,10 @@ its favorite status. A white outline means unpinned and a red heart means pinned
 
 Turn the wheel, swipe horizontally, or use Previous and Next to browse games
 within a shelf. Tap a side cover to select it. Press Centre or tap the center
-cover to launch it. Tap **⋯** in the top right to show **Exit**, **Menu**,
-and **Sort**. Tap outside the row to hide it. **Exit** becomes **Resume** when
-a game is loaded. The game pauses while you browse or use a menu.
+cover to launch it. Tap the top-right area around **⋯** to show **Exit**, **Menu**,
+and **Sort**. Tap outside the row to hide it. Turning the wheel or pressing a
+physical button also hides it and carries out the usual action. **Exit** becomes
+**Resume** when a game is loaded. The game pauses while you browse or use a menu.
 
 Pocket Boy preloads nearby artwork and caches up to 64 resized
 covers on the SD card. **Refresh ROMs and covers** clears the cache. Compatible
@@ -132,9 +133,9 @@ shoulder buttons. Their backgrounds default to 30% transparency. Menu,
 Select, and Start sit near the bottom. NES and SNES use a 4:3 picture
 with the default Fit setting.
 
-Tap **⋯** near the top center while playing to hide or show the touch
-controls. Hidden controls ignore taps. Pocket Boy moves the dots to a free
-spot if a custom button layout covers the default position.
+Swipe inward from near either side while playing to hide or show the touch
+controls. Hidden controls ignore taps. Buttons near either edge
+still respond to a tap or a hold.
 
 - **Menu → Display and controls → Physical buttons** assigns each of the
   five Q2 buttons to a cartridge action. Remaps apply during gameplay. Centre
