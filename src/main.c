@@ -158,6 +158,12 @@ static enum Scale scaling;
 static enum VideoFilter video_filter = SHARP_BILINEAR;
 static int running, fast, dirty = 1, slot, edit_button, dragging = -1;
 static int drag_x, drag_y, edit_start_x, edit_start_y, edit_moved, touch_button = -1, wheel_delta, menu_focus;
+static bool game_controls_hidden;
+static int game_toggle_x = -1, game_toggle_y;
+
+#define GAME_TOGGLE_HALF_W 24
+#define GAME_TOGGLE_HALF_H 18
+#define GAME_TOGGLE_TOP 48
 
 static enum Action confirm_action;
 static uint64_t wheel_time, notice_end, next_save;
@@ -199,6 +205,7 @@ static uint64_t flow_started, flow_draw_at, title_since, system_slide_started;
 static uint64_t prefetch_selection, prefetch_at;
 static int prefetched, last_marquee_offset;
 static bool touching_flow;
+static bool browser_actions_open;
 static enum { TOUCH_TAP, TOUCH_HORIZONTAL, TOUCH_VERTICAL } flow_gesture;
 static int flow_down_x, flow_down_y, system_slide_direction, system_slide_offset;
 
@@ -212,6 +219,8 @@ static int flow_down_x, flow_down_y, system_slide_direction, system_slide_offset
 #define LIST_HEART_X (WIDTH - 64)
 #define SORT_X 235
 #define SORT_W 103
+#define MORE_X (WIDTH - 94)
+#define MORE_W 56
 #define FLOW_FOOT_Y 272
 #define SHELF_TRAVEL 270
 #define SYSTEM_SLIDE_NS 210000000ull
@@ -349,6 +358,12 @@ static void rect(int x, int y, int w, int h, uint32_t fill) {
     for (int row = top; row < bottom; ++row)
         for (int col = left; col < right; ++col) canvas[row * WIDTH + col] = fill;
 }
+static void draw_ellipsis(int x, int y) {
+    for (int offset = -7; offset <= 7; offset += 7) {
+        rect(x + offset - 3, y - 3, 6, 6, RGB(0x101010));
+        rect(x + offset - 2, y - 2, 4, 4, GRAY);
+    }
+}
 static inline uint32_t blend_video(uint32_t a, uint32_t b, unsigned weight);
 static void draw_mask(int x, int y, int width, int height, const void *mask_bytes,
                       uint32_t ink, int left, int right) {
@@ -413,6 +428,41 @@ static bool overlay_visible(int index) {
     return (index < TOUCH_X || active_system == SYSTEM_SNES) &&
            supports_action(active_system, button->keys);
 }
+static bool toggle_fits(int x, int y) {
+    for (int i = 0; i < CONTROLS; ++i) {
+        if (!overlay_visible(i)) continue;
+        const Button *b = &buttons[i];
+        int h = button_height(i, b), radius = button_radius(i, b);
+        int nearest_x = clamp(b->x + b->size / 2, x - GAME_TOGGLE_HALF_W, x + GAME_TOGGLE_HALF_W - 1);
+        int nearest_y = clamp(b->y + h / 2, y - GAME_TOGGLE_HALF_H, y + GAME_TOGGLE_HALF_H - 1);
+        int reach = radius + TOUCH_HIT_PADDING;
+        if (shape_distance_squared(nearest_x - b->x, nearest_y - b->y, b->size, h, radius) < reach * reach)
+            return false;
+    }
+    return true;
+}
+
+static void place_game_toggle(void) {
+    const int center = WIDTH / 2;
+    game_toggle_x = center;
+    game_toggle_y = GAME_TOGGLE_TOP;
+    if (toggle_fits(game_toggle_x, game_toggle_y)) return;
+
+    /* Pick the nearest free tap area once per layout, below the fast-forward badge. */
+    game_toggle_x = -1;
+    int best = WIDTH * WIDTH + HEIGHT * HEIGHT;
+    for (int y = GAME_TOGGLE_TOP; y <= HEIGHT - GAME_TOGGLE_HALF_H - 14; y += 8) {
+        for (int x = GAME_TOGGLE_HALF_W + 14; x <= WIDTH - GAME_TOGGLE_HALF_W - 14; x += 8) {
+            int dx = x - center, dy = y - GAME_TOGGLE_TOP;
+            int distance = dx * dx + dy * dy;
+            if (distance >= best || !toggle_fits(x, y)) continue;
+            best = distance;
+            game_toggle_x = x;
+            game_toggle_y = y;
+        }
+    }
+}
+
 static int control_choices(bool touch, int choices[CONTROLS]) {
     int count = 0;
     if (touch) {
@@ -557,7 +607,7 @@ static void draw_game(void) {
     if (video_filter == SHARP_BILINEAR &&
         (picture.width % cart_width || picture.height % cart_height)) draw_sharp(picture);
     else draw_nearest(picture);
-    for (int i = 0; i < CONTROLS; ++i) {
+    for (int i = 0; !game_controls_hidden && i < CONTROLS; ++i) {
         if (!overlay_visible(i)) continue;
         char label[12];
         const char *name = button_label(i, &buttons[i]);
@@ -575,6 +625,7 @@ static void draw_game(void) {
         else snprintf(badge, sizeof badge, ">> %dx target", fast_rate);
         text_at(138, 10, badge, ACCENT, 244);
     }
+    if (game_toggle_x >= 0) draw_ellipsis(game_toggle_x, game_toggle_y);
 }
 static void header(const char *title, const char *sub) {
     rect(0, 0, WIDTH, HEIGHT, DARK);
@@ -1063,7 +1114,9 @@ static int latest_state(void) {
 static void set_screen(enum Screen next) {
     if (!smoke && running && (screen == GAME || next == GAME)) platform_audio_reset();
     screen = next;
+    if (screen == GAME) place_game_toggle();
     touching_flow = false;
+    browser_actions_open = false;
     flow_position = shelf->selected;
     flow_started = 0;
     previous_shelf = NULL;
@@ -1392,6 +1445,7 @@ static bool load_rom(const char *path) {
     strcpy(active_rom, path);
     cartridge_saves(false);
     running = 1;
+    game_controls_hidden = false;
     slot = 0;
     fast = 0;
     have_frame = false;
@@ -1741,6 +1795,10 @@ static void draw_browser(void) {
     }
     rect(0, 0, WIDTH, BROWSER_BUTTON_Y + 38, SHELF_INK);
     draw_system_indicator();
+    if (!browser_actions_open) {
+        draw_ellipsis(MORE_X + MORE_W / 2, BROWSER_BUTTON_Y + 19);
+        return;
+    }
     char sort[26];
     snprintf(sort, sizeof sort, "Sort: %s", sort_short[library.sort]);
     browser_button(SORT_X, BROWSER_BUTTON_Y, SORT_W, sort, true);
@@ -1903,6 +1961,7 @@ static void draw_ui(void) {
 
 static int hit(int x, int y) {
     if (x < 0 || y < 0 || x >= WIDTH || y >= HEIGHT) return -1;
+    if (screen == GAME && game_controls_hidden) return -1;
     int nearest = -1;
     float best = TOUCH_HIT_PADDING;
     for (int i = CONTROLS - 1; i >= 0; --i) {
@@ -2197,13 +2256,24 @@ static void browser_touch(char action, int x, int y) {
         return;
     }
     if (abs(dx) > 15 || abs(dy) > 15) return;
-    if (within(x, y, SORT_X, BROWSER_BUTTON_Y, SORT_W)) {
-        set_screen(BROWSER_OPTIONS);
-        menu_focus = library.sort;
-    } else if (within(x, y, EXIT_X, BROWSER_BUTTON_Y, EXIT_W)) go_back();
-    else if (within(x, y, APP_MENU_X, BROWSER_BUTTON_Y, APP_MENU_W)) set_screen(APP_MENU);
-    else if (!shelf_has_games(shelf) || previous_shelf) return;
-    else if (!browser_list() && y >= BROWSER_BUTTON_Y + 38) tap_cover(x, y);
+    if (browser_actions_open) {
+        browser_actions_open = false;
+        dirty = 1;
+        if (within(x, y, SORT_X, BROWSER_BUTTON_Y, SORT_W)) {
+            set_screen(BROWSER_OPTIONS);
+            menu_focus = library.sort;
+        } else if (within(x, y, EXIT_X, BROWSER_BUTTON_Y, EXIT_W)) go_back();
+        else if (within(x, y, APP_MENU_X, BROWSER_BUTTON_Y, APP_MENU_W)) set_screen(APP_MENU);
+        return;
+    }
+    if (within(x, y, MORE_X, BROWSER_BUTTON_Y, MORE_W) &&
+        within(flow_down_x, flow_down_y, MORE_X, BROWSER_BUTTON_Y, MORE_W)) {
+        browser_actions_open = true;
+        dirty = 1;
+        return;
+    }
+    if (!shelf_has_games(shelf) || previous_shelf) return;
+    if (!browser_list() && y >= BROWSER_BUTTON_Y + 38) tap_cover(x, y);
     else if (browser_list()) {
         int row = (y - LIST_TOP) / LIST_ROW;
         int index = list_first() + row;
@@ -2234,6 +2304,14 @@ static void read_touch(char action, int x, int y) {
     if (action != 'd') return;
     switch (screen) {
     case GAME: {
+        if (game_toggle_x >= 0 && x >= game_toggle_x - GAME_TOGGLE_HALF_W &&
+            x < game_toggle_x + GAME_TOGGLE_HALF_W && y >= game_toggle_y - GAME_TOGGLE_HALF_H &&
+            y < game_toggle_y + GAME_TOGGLE_HALF_H) {
+            game_controls_hidden = !game_controls_hidden;
+            touch_keys = 0;
+            touch_button = -1;
+            break;
+        }
         int which = hit(x, y);
         if (which < 0) break;
         touch_button = which;
@@ -2532,6 +2610,36 @@ static int smoke_test(const char *path) {
     const Button *menu = &buttons[MENU_BUTTON];
     int menu_x = menu->x + menu->size / 2, menu_y = menu->y - TOUCH_HIT_PADDING;
     Button saved_b = buttons[B];
+    if (game_toggle_x != WIDTH / 2 || game_toggle_y != GAME_TOGGLE_TOP) { close_rom(); return 45; }
+    /* Only the expanded hit area crosses the default toggle position. */
+    move_button(B, WIDTH / 2 - saved_b.size / 2, GAME_TOGGLE_TOP + GAME_TOGGLE_HALF_H + 3);
+    place_game_toggle();
+    if (game_toggle_x < 0 || (game_toggle_x == WIDTH / 2 && game_toggle_y == GAME_TOGGLE_TOP)) {
+        close_rom(); return 46;
+    }
+    for (int y = game_toggle_y - GAME_TOGGLE_HALF_H; y < game_toggle_y + GAME_TOGGLE_HALF_H; ++y) {
+        for (int x = game_toggle_x - GAME_TOGGLE_HALF_W; x < game_toggle_x + GAME_TOGGLE_HALF_W; ++x) {
+            if (hit(x, y) >= 0) { close_rom(); return 47; }
+        }
+    }
+    buttons[B] = saved_b;
+    place_game_toggle();
+    read_touch('d', game_toggle_x, game_toggle_y);
+    read_touch('u', game_toggle_x, game_toggle_y);
+    read_touch('d', menu_x, menu_y);
+    read_touch('u', menu_x, menu_y);
+    read_touch('d', b->x + b->size / 2, b->y + b->size / 2);
+    read_event((Event){'g', 'd', 116, 0});
+    if (!game_controls_hidden || screen != GAME || touch_keys || physical_keys != KEY(A) ||
+        input_state(0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_MASK) != KEY(A)) {
+        close_rom(); return 48;
+    }
+    read_touch('u', b->x + b->size / 2, b->y + b->size / 2);
+    read_event((Event){'g', 'u', 116, 0});
+    pressed_this_frame = 0;
+    read_touch('d', game_toggle_x, game_toggle_y);
+    read_touch('u', game_toggle_x, game_toggle_y);
+    if (game_controls_hidden) { close_rom(); return 49; }
     int menu_right = menu->x + menu->size;
     int menu_center_y = menu->y + button_height(MENU_BUTTON, menu) / 2;
     buttons[B].x = menu_right + TOUCH_HIT_PADDING;
@@ -2641,6 +2749,30 @@ static int smoke_test(const char *path) {
     schedule_video(clock_ns());
     if (screen != BROWSER || emulation_active() || allow_video || core != previous_core ||
         slot != 3) { close_rom(); return 27; }
+    const int toolbar_y = BROWSER_BUTTON_Y + 13;
+    read_touch('d', EXIT_X + 25, toolbar_y);
+    read_touch('u', EXIT_X + 25, toolbar_y);
+    if (screen != BROWSER || browser_actions_open) { close_rom(); return 40; }
+    read_touch('d', MORE_X + MORE_W / 2, toolbar_y);
+    read_touch('u', MORE_X + MORE_W / 2, toolbar_y);
+    if (!browser_actions_open) { close_rom(); return 41; }
+    read_touch('d', WIDTH / 2, HEIGHT / 2);
+    read_touch('u', WIDTH / 2, HEIGHT / 2);
+    if (screen != BROWSER || browser_actions_open) { close_rom(); return 42; }
+    read_touch('d', MORE_X + MORE_W / 2, toolbar_y);
+    read_touch('u', MORE_X + MORE_W / 2, toolbar_y);
+    read_touch('d', SORT_X + 25, toolbar_y);
+    read_touch('u', SORT_X + 25, toolbar_y);
+    if (screen != BROWSER_OPTIONS || browser_actions_open) { close_rom(); return 43; }
+    go_back();
+    read_touch('d', MORE_X + MORE_W / 2, toolbar_y);
+    read_touch('u', MORE_X + MORE_W / 2, toolbar_y);
+    read_touch('d', APP_MENU_X + 25, toolbar_y);
+    read_touch('u', APP_MENU_X + 25, toolbar_y);
+    if (screen != APP_MENU || browser_actions_open) { close_rom(); return 44; }
+    go_back();
+    read_touch('d', MORE_X + MORE_W / 2, toolbar_y);
+    read_touch('u', MORE_X + MORE_W / 2, toolbar_y);
     read_touch('d', EXIT_X + 25, BROWSER_BUTTON_Y + 13);
     read_touch('u', EXIT_X + 25, BROWSER_BUTTON_Y + 13);
     if (quitting || screen != GAME || !running || core != previous_core ||
@@ -2680,7 +2812,7 @@ static int smoke_test(const char *path) {
     for (int frame = 0; frame < 8; ++frame) core->run();
     if (!smoke_audio_frames) { close_rom(); return 33; }
     close_rom();
-    puts("PASS: ROM, save slots, controls, library pause and resume, speed selection, video budget, audio mute and resume");
+    puts("PASS: ROM, save slots, controls and overlay toggle, library toolbar, pause and resume, speed selection, video budget, audio mute and resume");
     return 0;
 }
 static void write_fatal(int sig) {
