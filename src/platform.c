@@ -27,6 +27,7 @@ static size_t map_size;
 static uint32_t *map;
 static snd_pcm_t *pcm;
 static int jack, soft_volume = 100, attenuation = 100;
+static int firmware_buttons;
 static unsigned sample_rate = 65536;
 #define PCM_QUEUE 4096
 static int16_t audio_queue[PCM_QUEUE][2];
@@ -107,7 +108,7 @@ static void open_audio(const char *device, const char *volume) {
     }
     fprintf(stderr, "ALSA open failed for %s\n", device);
 }
-int platform_open(const char *device, const char *volume, int music) {
+int platform_open(const char *device, const char *volume, int music, int firmware_keys) {
     if (pipe2(stop_pipe, O_NONBLOCK | O_CLOEXEC)) return 0;
     signal_writer = stop_pipe[1];
     signal(SIGTERM, request_quit);
@@ -133,7 +134,8 @@ int platform_open(const char *device, const char *volume, int music) {
     unlink(INPUT_SOCKET);
     if (bind(sock, (struct sockaddr *)&address, sizeof address)) return 0;
     if (!music) open_audio(device, volume);
-    grab_buttons();
+    firmware_buttons = firmware_keys;
+    if (!firmware_buttons) grab_buttons();
     fprintf(stderr, "ALSA=%s GPIO=%s\n", pcm ? "open" : "unavailable",
             raw_buttons ? "grabbed" : "using firmware fallback");
     return 1;
@@ -276,7 +278,7 @@ void platform_yield_to_player(void) {
 }
 void platform_resume_from_player(void) {
     if (fb >= 0 && !ioctl(fb, FBIOGET_VSCREENINFO, &video)) back = video.yoffset ? 0 : WIDTH;
-    if (keys < 0) grab_buttons();
+    if (keys < 0 && !firmware_buttons) grab_buttons();
 }
 void platform_audio_release(void) {
     audio_head = audio_count = 0;
@@ -291,6 +293,11 @@ void platform_audio_select(int route, int gain) {
     snprintf(volume, sizeof volume, "%d", gain >= 0 && gain <= 100 ? gain : 100);
     platform_audio_release();
     open_audio(route == 1 ? "plug:bluealsa" : route >= 2 ? "usb" : "plughw:0,0", volume);
+}
+int platform_audio_open(const char *device, const char *volume) {
+    platform_audio_release();
+    open_audio(device, volume);
+    return pcm != NULL;
 }
 void platform_audio_gain(int gain) {
     if (gain >= 0 && gain <= 100) soft_volume = gain;

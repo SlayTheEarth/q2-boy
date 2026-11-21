@@ -118,11 +118,21 @@ static int fast_rate = 2;
 #define AUDIO_REQUEST "/tmp/q2-boy.audio.req"
 #define AUDIO_REPLY "/tmp/q2-boy.audio.reply"
 #define AUDIO_MAGIC 0x51474131u
+#ifndef Q2_RUNTIME_DIR
+#define Q2_RUNTIME_DIR "/tmp"
+#endif
+#define AUDIO_MODE Q2_RUNTIME_DIR "/q2-boy.audio"
+#define NATIVE_VIEW Q2_RUNTIME_DIR "/q2-boy.view"
+#define QUIT_OPTION Q2_RUNTIME_DIR "/q2-boy.quit"
+#define ADDON_CAPS "/tmp/q2-addon.caps"
 enum AudioAction { AUDIO_GAME = 1, AUDIO_MUSIC, AUDIO_VOLUME, AUDIO_PREVIOUS, AUDIO_PLAY, AUDIO_NEXT, AUDIO_NOW_PLAYING };
 struct AudioCommand { uint32_t magic, seq; int32_t action, value; };
 struct AudioReply { uint32_t magic, seq; int32_t music, volume, limit, route, gain, playing, native_ui; };
 static struct AudioReply audio_reply;
 static bool audio_bridge, music_mode, native_supported, native_yielded;
+static bool audio2, firmware_keys, prefer_music, remember_source, quit_off, audio_timeout;
+static uint64_t native_request_time;
+static char game_device[16], game_gain[8];
 static int local_volume = 100, audio_route;
 static uint32_t audio_seq;
 static enum AudioAction pending_action;
@@ -586,6 +596,134 @@ static int file_write(const char *path, const void *data, size_t length) {
     unlink(temp);
     return false;
 }
+static bool read_text(const char *path, char *buf, size_t capacity) {
+    FILE *file = fopen(path, "rb");
+    if (!file) return false;
+    size_t n = fread(buf, 1, capacity - 1, file);
+    bool ok = !ferror(file) && fgetc(file) == EOF && !ferror(file);
+    fclose(file);
+    if (!ok || memchr(buf, 0, n)) { errno = EINVAL; return false; }
+    buf[n] = 0;
+    return true;
+}
+static bool has_cap(const char *caps, const char *word) {
+    size_t length = strlen(word);
+    for (const char *at = caps; *at;) {
+        at += strspn(at, " \t\r\n");
+        size_t n = strcspn(at, " \t\r\n");
+        if (n == length && !strncmp(at, word, n)) return true;
+        at += n;
+    }
+    return false;
+}
+static bool enable_manifest_audio(bool supported, bool *was_audio2) {
+    char manifest[PATH_CAP], text[512];
+    if (!join_path(manifest, app_dir, "q2app") || !read_text(manifest, text, sizeof text))
+        return false;
+    char *line = text;
+    while (line) {
+        char *end = strchr(line, '\n');
+        if ((end ? end - line : (ptrdiff_t)strlen(line)) >= 7 &&
+            !strncmp(line, "audio=", 6) && (line[6] == '1' || line[6] == '2') &&
+            (line[7] == '\r' || line[7] == '\n' || !line[7])) {
+            *was_audio2 = line[6] == '2';
+            if (*was_audio2 == supported) return true;
+            line[6] = supported ? '2' : '1';
+            return file_write(manifest, text, strlen(text));
+        }
+        line = end ? end + 1 : NULL;
+    }
+    return false;
+}
+static void store_audio_source(bool music) {
+    char path[PATH_CAP];
+    const char *mode = music ? "music\n" : "game\n";
+    prefer_music = music;
+    if (file_path(path, sizeof path, data_dir, "/audio-source.cfg"))
+        (void)file_write(path, mode, strlen(mode));
+}
+static bool write_quit_option(bool off) {
+    if (off) return file_write(QUIT_OPTION, "off", 3);
+    return !unlink(QUIT_OPTION) || errno == ENOENT;
+}
+static bool switch_audio2(enum AudioAction action, bool remember) {
+    const char *mode = action == AUDIO_MUSIC ? "music" : "game";
+    bool had_audio = !music_mode;
+    if (action == AUDIO_MUSIC) platform_audio_release();
+    if (!file_write(AUDIO_MODE, mode, strlen(mode))) {
+        if (action == AUDIO_MUSIC && had_audio && game_device[0])
+            (void)platform_audio_open(game_device, game_gain);
+        status("Could not request Q2 audio");
+        return false;
+    }
+    if (action == AUDIO_MUSIC) music_mode = true;
+    pending_action = action;
+    remember_source = remember;
+    audio_request_time = clock_ns();
+    audio_timeout = false;
+    dirty = 1;
+    return true;
+}
+static void yield_player(void) {
+    platform_yield_to_player();
+    physical_keys = pressed_this_frame = touch_keys = 0;
+    held_buttons = gameplay_buttons = 0;
+    native_yielded = true;
+}
+static void resume_from_player(void) {
+    native_yielded = false;
+    last_activity = clock_ns();
+    platform_resume_from_player();
+    physical_keys = pressed_this_frame = touch_keys = 0;
+    held_buttons = gameplay_buttons = 0;
+    menu_focus = 0;
+    dirty = 1;
+}
+static bool audio_arguments(const char *line, char device[16], char volume[8]) {
+    char extra;
+    int fields = sscanf(line, "%15s %7s %c", device, volume, &extra);
+    if (fields == 1) { volume[0] = 0; return !strcmp(device, "plughw:0,0"); }
+    if (fields != 2 || (strcmp(device, "plug:bluealsa") && strcmp(device, "usb"))) return false;
+    const char *digits = volume + (!strcmp(device, "usb") && volume[0] == 'h');
+    return *digits && strlen(digits) <= 3 && strspn(digits, "0123456789") == strlen(digits) &&
+           atoi(digits) <= 100;
+}
+static void audio2_poll(uint64_t now) {
+    if (pending_action) {
+        char reply[48], device[16], volume[8];
+        bool have_reply = read_text(AUDIO_MODE, reply, sizeof reply);
+        if (pending_action == AUDIO_GAME && have_reply && audio_arguments(reply, device, volume)) {
+            pending_action = 0;
+            if (platform_audio_open(device, volume)) {
+                strcpy(game_device, device);
+                strcpy(game_gain, volume);
+                music_mode = false;
+                if (remember_source) store_audio_source(false);
+            } else {
+                (void)switch_audio2(AUDIO_MUSIC, false);
+                status("Could not open game audio");
+            }
+            dirty = 1;
+        } else if (pending_action == AUDIO_MUSIC && !have_reply && errno == ENOENT) {
+            pending_action = 0;
+            if (remember_source) store_audio_source(true);
+            dirty = 1;
+        } else if (!audio_timeout && now - audio_request_time > 5000000000ull) {
+            audio_timeout = true;
+            status("Waiting for Q2 audio. You can exit if it does not respond.");
+        }
+    }
+    if (!native_yielded) return;
+    char view[12];
+    if (read_text(NATIVE_VIEW, view, sizeof view)) {
+        if (!strcmp(view, "open")) { native_request_time = 0; return; }
+        if (!native_request_time || now - native_request_time < 5000000000ull) return;
+        if (unlink(NATIVE_VIEW) && errno != ENOENT) return;
+        status("Could not open Q2 Now Playing");
+    } else if (errno != ENOENT) return;
+    resume_from_player();
+    if (!prefer_music && music_mode && !pending_action) (void)switch_audio2(AUDIO_GAME, false);
+}
 static uint64_t display_deadline(uint64_t now) {
     if (!display_bridge || dimmed || native_yielded || screen == GAME) return UINT64_MAX;
     uint64_t deadline = last_activity + DISPLAY_IDLE_NS;
@@ -600,13 +738,18 @@ static uint64_t display_deadline(uint64_t now) {
 static void request_audio(enum AudioAction action, int value) {
     if (!audio_bridge || pending_action) return;
     bool opening = action == AUDIO_NOW_PLAYING;
-    bool releasing = (action == AUDIO_MUSIC || opening) && !music_mode;
-    if (opening) {
-        platform_yield_to_player();
-        physical_keys = pressed_this_frame = touch_keys = 0;
-        held_buttons = gameplay_buttons = 0;
-        native_yielded = true;
+    if (audio2) {
+        if (!opening) { (void)switch_audio2(action, true); return; }
+        yield_player();
+        if (!file_write(NATIVE_VIEW, "now", 3) || (!music_mode && !switch_audio2(AUDIO_MUSIC, false))) {
+            unlink(NATIVE_VIEW);
+            resume_from_player();
+            status("Could not open Q2 Now Playing");
+        } else native_request_time = clock_ns();
+        return;
     }
+    bool releasing = (action == AUDIO_MUSIC || opening) && !music_mode;
+    if (opening) yield_player();
     if (releasing) platform_audio_release();
     struct AudioCommand command = {AUDIO_MAGIC, ++audio_seq, action, value};
     if (!file_write(AUDIO_REQUEST, &command, sizeof command)) {
@@ -621,11 +764,13 @@ static void request_audio(enum AudioAction action, int value) {
 }
 static uint64_t audio_deadline(void) {
     if (!audio_bridge) return UINT64_MAX;
+    if (audio2 && !pending_action && !native_yielded) return UINT64_MAX;
     return audio_polled + (pending_action || native_yielded || screen == AUDIO ? 75000000ull : 500000000ull);
 }
 static void audio_poll(uint64_t now) {
     if (now < audio_deadline()) return;
     audio_polled = now;
+    if (audio2) { audio2_poll(now); return; }
     struct AudioReply next = {0};
     FILE *file = fopen(AUDIO_REPLY, "rb");
     if (file) {
@@ -638,10 +783,7 @@ static void audio_poll(uint64_t now) {
         bool switched = music_mode != (next.music != 0);
         if (switched) {
             music_mode = next.music != 0;
-            char path[PATH_CAP];
-            const char *mode = music_mode ? "music\n" : "game\n";
-            if (file_path(path, sizeof path, data_dir, "/audio-source.cfg"))
-                (void)file_write(path, mode, strlen(mode));
+            store_audio_source(music_mode);
             if (music_mode) platform_audio_release();
         }
         if (!music_mode && (switched || audio_route != next.route)) {
@@ -654,13 +796,7 @@ static void audio_poll(uint64_t now) {
             if (screen == AUDIO) dirty = 1;
         }
         if (native_yielded && !next.native_ui && !pending_action) {
-            native_yielded = false;
-            last_activity = now;
-            platform_resume_from_player();
-            physical_keys = pressed_this_frame = touch_keys = 0;
-            held_buttons = gameplay_buttons = 0;
-            menu_focus = 0; /* Resume is the first row of the emulator menu. */
-            dirty = 1;
+            resume_from_player();
         }
         if (memcmp(&next, &audio_reply, sizeof next)) {
             audio_reply = next;
@@ -686,8 +822,8 @@ static int write_overlay(char *buffer, size_t remaining, const Button *b) {
 
 static bool write_config(const char *path, const ControlProfile *profile) {
     char buffer[768];
-    int used = snprintf(buffer, sizeof buffer, "%d 9 %d %d %d %d\n",
-                        scaling, fast_rate, local_volume, video_filter, resume_latest);
+    int used = snprintf(buffer, sizeof buffer, "%d 9 %d %d %d %d %d\n",
+                        scaling, fast_rate, local_volume, video_filter, resume_latest, quit_off);
     for (int i = 0; i < TOUCH_X; ++i)
         used += write_overlay(buffer + used, sizeof buffer - used, &profile->overlays[i]);
     for (int i = 0; i < PHYSICAL_COUNT; ++i)
@@ -760,10 +896,12 @@ static bool read_overlay(FILE *f, int version, int row, ControlProfile *profile)
 static void read_config(const char *path, ControlProfile *profile, bool app_settings) {
     FILE *f = fopen(path, "r");
     int saved_scale = FIT, version = 1, rate = 2, volume = 100, saved_filter = SHARP_BILINEAR, resume = 0;
+    int saved_quit_off = 0;
     char line[80];
     if (!f) return;
     if (fgets(line, sizeof line, f))
-        sscanf(line, "%d %d %d %d %d %d", &saved_scale, &version, &rate, &volume, &saved_filter, &resume);
+        sscanf(line, "%d %d %d %d %d %d %d", &saved_scale, &version, &rate, &volume,
+               &saved_filter, &resume, &saved_quit_off);
     if (app_settings) {
         local_volume = clamp(volume, 0, 100);
         platform_audio_attenuation(local_volume);
@@ -771,6 +909,7 @@ static void read_config(const char *path, ControlProfile *profile, bool app_sett
         video_filter = saved_filter == NEAREST ? NEAREST : SHARP_BILINEAR;
         if (rate == 2 || rate == 3 || rate == 5) fast_rate = rate == 5 ? 3 : rate;
         resume_latest = resume == 1;
+        quit_off = saved_quit_off == 1;
     }
     int rows = version < 3 ? (int)(sizeof previous_overlays / sizeof previous_overlays[0]) :
                version < 6 ? TOUCH_A : TOUCH_X;
@@ -1350,6 +1489,7 @@ static int menu_items(MenuItem *items) {
         ITEM(15, 95, 345, 40, label, true);
         ITEM(15, 138, 345, 40, filter_label(), true);
         ITEM(15, 181, 345, 40, "Copy control layout", true);
+        ITEM(15, 224, 345, 40, quit_off ? "Force close: Off" : "Force close: Hold Return + Centre", firmware_keys);
         ITEM(15, 267, 345, 40, "Back", true);
         break;
     case COPY_TARGET: case COPY_SOURCE:
@@ -1852,6 +1992,10 @@ static void activate_menu(int index) {
             video_filter = video_filter == SHARP_BILINEAR ? NEAREST : SHARP_BILINEAR;
             store_config();
         } else if (index == 3) set_screen(COPY_TARGET);
+        else if (index == 4) {
+            if (write_quit_option(!quit_off)) { quit_off = !quit_off; store_config(); }
+            else status("Could not set force-close shortcut");
+        }
         else go_back();
         break;
     case COPY_TARGET:
@@ -2583,7 +2727,7 @@ static void log_launch(void) {
     sigaction(SIGSEGV, &action, NULL);
     sigaction(SIGABRT, &action, NULL);
     sigaction(SIGFPE, &action, NULL);
-    fprintf(stderr, "\nq2-boy 0.3.5, engine=%s\n",
+    fprintf(stderr, "\nq2-boy 0.3.6, engine=%s\n",
             use_dynarec ? "dynamic recompiler (opt-in)" : "interpreter");
     FILE *memory = fopen("/proc/meminfo", "r");
     if (memory) {
@@ -2608,24 +2752,35 @@ int main(int argc, char **argv) {
         }
     }
     if (!prepare_dirs()) return 1;
+    locate_app(argv[0]);
     if (!smoke) {
         log_launch();
         const char *bridge = getenv("Q2_BOY_AUDIO_BRIDGE");
-        audio_bridge = bridge != NULL;
-        native_supported = bridge && *bridge == '2';
+        char caps[512] = "";
+        if (!read_text(ADDON_CAPS, caps, sizeof caps)) caps[0] = 0;
+        bool supports_audio2 = !bridge && has_cap(caps, "audio2");
+        bool was_audio2 = false;
+        bool manifest_ready = !bridge && enable_manifest_audio(supports_audio2, &was_audio2);
+        audio2 = supports_audio2 && argc == 1;
+        firmware_keys = !bridge && has_cap(caps, "gameview");
+        audio_bridge = bridge != NULL || audio2;
+        native_supported = (bridge && *bridge == '2') || (audio2 && firmware_keys);
         const char *display = getenv("Q2_BOY_DISPLAY_BRIDGE");
         display_bridge = display && !strcmp(display, "1");
-        music_mode = audio_bridge && argc == 1;
+        music_mode = argc == 1 && (audio_bridge || was_audio2);
         audio_route = argc > 1 && !strcmp(argv[1], "plug:bluealsa") ? 1 :
                       argc > 1 && !strcmp(argv[1], "usb") ? (argc > 2 && argv[2][0] == 'h' ? 3 : 2) : 0;
-        if (!platform_open(argc > 1 ? argv[1] : NULL, argc > 2 ? argv[2] : NULL, music_mode)) {
+        if (!platform_open(argc > 1 ? argv[1] : NULL, argc > 2 ? argv[2] : NULL, music_mode, firmware_keys)) {
             fprintf(stderr, "Framebuffer or input socket initialization failed: %s\n", strerror(errno));
             platform_close();
             return 1;
         }
+        if (supports_audio2 && argc > 1)
+            status(manifest_ready ? "Reopen Pocket Boy to enable Q2 music" : "Could not enable Q2 music on the card");
+        else if (!supports_audio2 && was_audio2)
+            status(manifest_ready ? "Reopen Pocket Boy to enable game audio" : "Could not restore game audio on the card");
     }
     load_config();
-    locate_app(argv[0]);
     initialize_palette();
     if (smoke) {
         int result = smoke_test(argv[2]);
@@ -2634,7 +2789,15 @@ int main(int argc, char **argv) {
         close_shared_cores();
         return result;
     }
-    if (!raw_buttons && !native_supported) status("Limited input: holding Up may exit");
+    if (firmware_keys && !write_quit_option(quit_off)) status("Could not set force-close shortcut");
+    if (audio2) {
+        char path[PATH_CAP], mode[24];
+        prefer_music = file_path(path, sizeof path, data_dir, "/audio-source.cfg") &&
+                       read_text(path, mode, sizeof mode) && has_cap(mode, "music");
+        if (!prefer_music) (void)switch_audio2(AUDIO_GAME, false);
+    }
+    if (!raw_buttons && !native_supported && !firmware_keys && !notice_end)
+        status("Limited input: holding Up may exit");
     load_library();
     load_favorites();
     library_migrate(&data_paths);

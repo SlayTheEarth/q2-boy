@@ -17,10 +17,11 @@ All systems share the same menus, display options, save slots, and 2×/3×
 fast-forward settings. Actual fast-forward speed depends on the game.
 The archive includes no commercial ROMs or Nintendo BIOS files.
 
-The standard Q2-Pod 1.8.8 card-game launcher is sufficient for emulation,
-controls, game audio, save states, and fast-forward. Background Q2 music
-and native Now Playing use the [q2-boy firmware bridge](https://github.com/DiamondBond/q2-pod/pull/426).
-Firmware with that bridge keeps music already playing when q2-boy opens.
+The Q2-Pod 1.8.8 card-game launcher supports emulation, game audio, save
+states, and fast-forward. Background music uses the
+[Q2-Pod audio interface](https://github.com/DiamondBond/q2-pod/pull/426).
+When first upgrading to firmware with that interface, open Pocket Boy,
+exit, and open it again to enable the new audio options.
 
 ## Install on the Q2
 
@@ -91,6 +92,22 @@ change the picture mode and filter, or copy a control layout between systems.
 loads the newest compatible manual state from any of the game's ten slots,
 or starts normally when there is no compatible state.
 
+On firmware with card-game Now Playing support, choose **Force close**
+to toggle between holding **Return + Centre** for 1.2 seconds and **Off**.
+The firmware keeps its normal idle behavior.
+
+## Q2 music and Now Playing
+
+Choose **Game Audio** or **Q2 Music** under **Audio**. Game Audio is the
+default. Pocket Boy remembers your choice.
+
+On firmware with card-game Now Playing support, Pocket Boy receives all
+four D-pad buttons while Q2 music plays. From a game, choose **Q2 Now
+Playing** in the emulator menu. Q2-Pod takes over the screen and playback
+buttons while the game is paused. Press **Return** to go back to the
+emulator menu. If you were using Game Audio, Pocket Boy restores it when
+you return.
+
 ## Picture scaling
 
 Open **Menu → Display and controls** while playing. **Picture** cycles through
@@ -131,8 +148,8 @@ layout** in the library, choose the console to update, then choose the source.
 The copy applies to shared controls and preserves console-specific bindings.
 
 The emulator menu puts the fast-forward toggle beside its speed setting.
-**ROM library** keeps the current cartridge running at normal speed in the
-background. Choose **Resume** to return to it, or select another cartridge.
+**ROM library** pauses the current game. Choose **Resume** to return to
+it, or select another cartridge.
 
 ## Development
 
