@@ -17,10 +17,11 @@ All systems share the same menus, display options, save slots, and 2×/3×
 fast-forward settings. Actual fast-forward speed depends on the game.
 The archive includes no commercial ROMs or Nintendo BIOS files.
 
-The standard Q2-Pod 1.8.8 card-game launcher is sufficient for emulation,
-controls, game audio, save states, and fast-forward. Background Q2 music
-and native Now Playing use the [q2-boy firmware bridge](https://github.com/DiamondBond/q2-pod/pull/426).
-Firmware with that bridge keeps music already playing when q2-boy opens.
+The Q2-Pod 1.8.8 card-game launcher supports emulation, game audio, save
+states, and fast-forward. Background music uses the
+[Q2-Pod audio interface](https://github.com/DiamondBond/q2-pod/pull/426).
+When first upgrading to firmware with that interface, open Pocket Boy,
+exit, and open it again to enable the new audio options.
 
 ## Install on the Q2
 
@@ -60,8 +61,9 @@ its favorite status. A white outline means unpinned and a red heart means pinned
 
 Turn the wheel, swipe horizontally, or use Previous and Next to browse games
 within a shelf. Tap a side cover to select it. Press Centre or tap the center
-cover to launch it. **Exit** is in the top left and becomes **Resume** when a
-game is loaded. The game pauses while you browse or use a menu.
+cover to launch it. Tap **⋯** in the top right to show **Exit**, **Menu**,
+and **Sort**. Tap outside the row to hide it. **Exit** becomes **Resume** when
+a game is loaded. The game pauses while you browse or use a menu.
 
 Pocket Boy preloads nearby artwork and caches up to 64 resized
 covers on the SD card. **Refresh ROMs and covers** clears the cache. Compatible
@@ -85,11 +87,27 @@ view on the SD card.
 
 ## Pocket Boy menu
 
-Open **Menu** at the top of the library to set the default launch behavior,
+Open **⋯ → Menu** in the library to set the default launch behavior,
 change the picture mode and filter, or copy a control layout between systems.
 **Launch: Start normally** is the default. **Launch: Resume latest save state**
 loads the newest compatible manual state from any of the game's ten slots,
 or starts normally when there is no compatible state.
+
+On firmware with card-game Now Playing support, choose **Force close**
+to toggle between holding **Return + Centre** for 1.2 seconds and **Off**.
+The firmware keeps its normal idle behavior.
+
+## Q2 music and Now Playing
+
+Choose **Game Audio** or **Q2 Music** under **Audio**. Game Audio is the
+default. Pocket Boy remembers your choice.
+
+On firmware with [card-game Now Playing support](https://github.com/DiamondBond/q2-pod/pull/463),
+Pocket Boy receives all four D-pad buttons while Q2 music plays. From a game, choose **Q2 Now
+Playing** in the emulator menu. Q2-Pod takes over the screen and playback
+buttons while the game is paused. Press **Return** to go back to the
+emulator menu. If you were using Game Audio, Pocket Boy restores it when
+you return.
 
 ## Picture scaling
 
@@ -114,6 +132,10 @@ shoulder buttons. Their backgrounds default to 30% transparency. Menu,
 Select, and Start sit near the bottom. NES and SNES use a 4:3 picture
 with the default Fit setting.
 
+Tap **⋯** near the top center while playing to hide or show the touch
+controls. Hidden controls ignore taps. Pocket Boy moves the dots to a free
+spot if a custom button layout covers the default position.
+
 - **Menu → Display and controls → Physical buttons** assigns each of the
   five Q2 buttons to a cartridge action. Remaps apply during gameplay. Centre
   still confirms and Return still goes back in menus.
@@ -131,8 +153,8 @@ layout** in the library, choose the console to update, then choose the source.
 The copy applies to shared controls and preserves console-specific bindings.
 
 The emulator menu puts the fast-forward toggle beside its speed setting.
-**ROM library** keeps the current cartridge running at normal speed in the
-background. Choose **Resume** to return to it, or select another cartridge.
+**ROM library** pauses the current game. Choose **Resume** to return to
+it, or select another cartridge.
 
 ## Development
 

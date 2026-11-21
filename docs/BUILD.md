@@ -49,6 +49,13 @@ including the hidden `.boy` directory.
 
 ## Optional firmware bridge
 
+On firmware with the upstream `audio2` card-app capability, Pocket Boy uses
+the generic audio interface. The `gameview` capability adds the Now Playing
+handoff and the force-close shortcut. See the firmware's card-app protocol in
+[Q2-Pod internals](https://github.com/DiamondBond/q2-pod/blob/main/docs/internals.md#card-apps).
+
+### Older custom firmware
+
 The frontend runs on standard Q2-Pod 1.8.8 with game audio. The
 [optional bridge patch](../firmware/q2-pod-boy-audio.patch) lets the
 `.boy` card app switch audio sources and open native Now Playing.
@@ -77,3 +84,13 @@ q2-boy --smoke test.gba /path/to/existing-test-directory \
 
 Tests run against Q2 firmware libraries in a MIPS emulator. Use the physical
 Q2 for playback, display, and input checks.
+
+For the audio and Now Playing protocol test, build on a Linux host and run
+the binary from an empty scratch directory.
+
+```sh
+cc -D_GNU_SOURCE -DQ2_RUNTIME_DIR='"."' -std=gnu11 -O2 -ffunction-sections \
+  -fdata-sections -Wl,--gc-sections -I"$GPSP/libretro/libretro-common/include" \
+  tests/audio-view.c src/library_paths.c -o /tmp/q2-audio-view-test
+(cd "$(mktemp -d)" && /tmp/q2-audio-view-test)
+```

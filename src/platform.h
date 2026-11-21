@@ -7,7 +7,8 @@ typedef struct { char kind, action; int x, y; } Event;
 #include <signal.h>
 extern volatile sig_atomic_t quitting;
 extern int raw_buttons;
-int platform_open(const char *device, const char *volume, int music);
+int platform_open(const char *device, const char *volume, int music, int firmware_keys);
+int platform_audio_open(const char *device, const char *volume);
 void platform_audio_select(int route, int gain);
 void platform_audio_release(void);
 void platform_audio_set_rate(unsigned rate);

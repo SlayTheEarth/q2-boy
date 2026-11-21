@@ -118,11 +118,21 @@ static int fast_rate = 2;
 #define AUDIO_REQUEST "/tmp/q2-boy.audio.req"
 #define AUDIO_REPLY "/tmp/q2-boy.audio.reply"
 #define AUDIO_MAGIC 0x51474131u
+#ifndef Q2_RUNTIME_DIR
+#define Q2_RUNTIME_DIR "/tmp"
+#endif
+#define AUDIO_MODE Q2_RUNTIME_DIR "/q2-boy.audio"
+#define NATIVE_VIEW Q2_RUNTIME_DIR "/q2-boy.view"
+#define QUIT_OPTION Q2_RUNTIME_DIR "/q2-boy.quit"
+#define ADDON_CAPS "/tmp/q2-addon.caps"
 enum AudioAction { AUDIO_GAME = 1, AUDIO_MUSIC, AUDIO_VOLUME, AUDIO_PREVIOUS, AUDIO_PLAY, AUDIO_NEXT, AUDIO_NOW_PLAYING };
 struct AudioCommand { uint32_t magic, seq; int32_t action, value; };
 struct AudioReply { uint32_t magic, seq; int32_t music, volume, limit, route, gain, playing, native_ui; };
 static struct AudioReply audio_reply;
 static bool audio_bridge, music_mode, native_supported, native_yielded;
+static bool audio2, firmware_keys, prefer_music, remember_source, quit_off, audio_timeout;
+static uint64_t native_request_time;
+static char game_device[16], game_gain[8];
 static int local_volume = 100, audio_route;
 static uint32_t audio_seq;
 static enum AudioAction pending_action;
@@ -148,6 +158,12 @@ static enum Scale scaling;
 static enum VideoFilter video_filter = SHARP_BILINEAR;
 static int running, fast, dirty = 1, slot, edit_button, dragging = -1;
 static int drag_x, drag_y, edit_start_x, edit_start_y, edit_moved, touch_button = -1, wheel_delta, menu_focus;
+static bool game_controls_hidden;
+static int game_toggle_x = -1, game_toggle_y;
+
+#define GAME_TOGGLE_HALF_W 24
+#define GAME_TOGGLE_HALF_H 18
+#define GAME_TOGGLE_TOP 48
 
 static enum Action confirm_action;
 static uint64_t wheel_time, notice_end, next_save;
@@ -189,6 +205,7 @@ static uint64_t flow_started, flow_draw_at, title_since, system_slide_started;
 static uint64_t prefetch_selection, prefetch_at;
 static int prefetched, last_marquee_offset;
 static bool touching_flow;
+static bool browser_actions_open;
 static enum { TOUCH_TAP, TOUCH_HORIZONTAL, TOUCH_VERTICAL } flow_gesture;
 static int flow_down_x, flow_down_y, system_slide_direction, system_slide_offset;
 
@@ -202,6 +219,8 @@ static int flow_down_x, flow_down_y, system_slide_direction, system_slide_offset
 #define LIST_HEART_X (WIDTH - 64)
 #define SORT_X 235
 #define SORT_W 103
+#define MORE_X (WIDTH - 94)
+#define MORE_W 56
 #define FLOW_FOOT_Y 272
 #define SHELF_TRAVEL 270
 #define SYSTEM_SLIDE_NS 210000000ull
@@ -339,6 +358,12 @@ static void rect(int x, int y, int w, int h, uint32_t fill) {
     for (int row = top; row < bottom; ++row)
         for (int col = left; col < right; ++col) canvas[row * WIDTH + col] = fill;
 }
+static void draw_ellipsis(int x, int y) {
+    for (int offset = -7; offset <= 7; offset += 7) {
+        rect(x + offset - 3, y - 3, 6, 6, RGB(0x101010));
+        rect(x + offset - 2, y - 2, 4, 4, GRAY);
+    }
+}
 static inline uint32_t blend_video(uint32_t a, uint32_t b, unsigned weight);
 static void draw_mask(int x, int y, int width, int height, const void *mask_bytes,
                       uint32_t ink, int left, int right) {
@@ -403,6 +428,41 @@ static bool overlay_visible(int index) {
     return (index < TOUCH_X || active_system == SYSTEM_SNES) &&
            supports_action(active_system, button->keys);
 }
+static bool toggle_fits(int x, int y) {
+    for (int i = 0; i < CONTROLS; ++i) {
+        if (!overlay_visible(i)) continue;
+        const Button *b = &buttons[i];
+        int h = button_height(i, b), radius = button_radius(i, b);
+        int nearest_x = clamp(b->x + b->size / 2, x - GAME_TOGGLE_HALF_W, x + GAME_TOGGLE_HALF_W - 1);
+        int nearest_y = clamp(b->y + h / 2, y - GAME_TOGGLE_HALF_H, y + GAME_TOGGLE_HALF_H - 1);
+        int reach = radius + TOUCH_HIT_PADDING;
+        if (shape_distance_squared(nearest_x - b->x, nearest_y - b->y, b->size, h, radius) < reach * reach)
+            return false;
+    }
+    return true;
+}
+
+static void place_game_toggle(void) {
+    const int center = WIDTH / 2;
+    game_toggle_x = center;
+    game_toggle_y = GAME_TOGGLE_TOP;
+    if (toggle_fits(game_toggle_x, game_toggle_y)) return;
+
+    /* Pick the nearest free tap area once per layout, below the fast-forward badge. */
+    game_toggle_x = -1;
+    int best = WIDTH * WIDTH + HEIGHT * HEIGHT;
+    for (int y = GAME_TOGGLE_TOP; y <= HEIGHT - GAME_TOGGLE_HALF_H - 14; y += 8) {
+        for (int x = GAME_TOGGLE_HALF_W + 14; x <= WIDTH - GAME_TOGGLE_HALF_W - 14; x += 8) {
+            int dx = x - center, dy = y - GAME_TOGGLE_TOP;
+            int distance = dx * dx + dy * dy;
+            if (distance >= best || !toggle_fits(x, y)) continue;
+            best = distance;
+            game_toggle_x = x;
+            game_toggle_y = y;
+        }
+    }
+}
+
 static int control_choices(bool touch, int choices[CONTROLS]) {
     int count = 0;
     if (touch) {
@@ -547,7 +607,7 @@ static void draw_game(void) {
     if (video_filter == SHARP_BILINEAR &&
         (picture.width % cart_width || picture.height % cart_height)) draw_sharp(picture);
     else draw_nearest(picture);
-    for (int i = 0; i < CONTROLS; ++i) {
+    for (int i = 0; !game_controls_hidden && i < CONTROLS; ++i) {
         if (!overlay_visible(i)) continue;
         char label[12];
         const char *name = button_label(i, &buttons[i]);
@@ -565,6 +625,7 @@ static void draw_game(void) {
         else snprintf(badge, sizeof badge, ">> %dx target", fast_rate);
         text_at(138, 10, badge, ACCENT, 244);
     }
+    if (game_toggle_x >= 0) draw_ellipsis(game_toggle_x, game_toggle_y);
 }
 static void header(const char *title, const char *sub) {
     rect(0, 0, WIDTH, HEIGHT, DARK);
@@ -586,6 +647,134 @@ static int file_write(const char *path, const void *data, size_t length) {
     unlink(temp);
     return false;
 }
+static bool read_text(const char *path, char *buf, size_t capacity) {
+    FILE *file = fopen(path, "rb");
+    if (!file) return false;
+    size_t n = fread(buf, 1, capacity - 1, file);
+    bool ok = !ferror(file) && fgetc(file) == EOF && !ferror(file);
+    fclose(file);
+    if (!ok || memchr(buf, 0, n)) { errno = EINVAL; return false; }
+    buf[n] = 0;
+    return true;
+}
+static bool has_cap(const char *caps, const char *word) {
+    size_t length = strlen(word);
+    for (const char *at = caps; *at;) {
+        at += strspn(at, " \t\r\n");
+        size_t n = strcspn(at, " \t\r\n");
+        if (n == length && !strncmp(at, word, n)) return true;
+        at += n;
+    }
+    return false;
+}
+static bool enable_manifest_audio(bool supported, bool *was_audio2) {
+    char manifest[PATH_CAP], text[512];
+    if (!join_path(manifest, app_dir, "q2app") || !read_text(manifest, text, sizeof text))
+        return false;
+    char *line = text;
+    while (line) {
+        char *end = strchr(line, '\n');
+        if ((end ? end - line : (ptrdiff_t)strlen(line)) >= 7 &&
+            !strncmp(line, "audio=", 6) && (line[6] == '1' || line[6] == '2') &&
+            (line[7] == '\r' || line[7] == '\n' || !line[7])) {
+            *was_audio2 = line[6] == '2';
+            if (*was_audio2 == supported) return true;
+            line[6] = supported ? '2' : '1';
+            return file_write(manifest, text, strlen(text));
+        }
+        line = end ? end + 1 : NULL;
+    }
+    return false;
+}
+static void store_audio_source(bool music) {
+    char path[PATH_CAP];
+    const char *mode = music ? "music\n" : "game\n";
+    prefer_music = music;
+    if (file_path(path, sizeof path, data_dir, "/audio-source.cfg"))
+        (void)file_write(path, mode, strlen(mode));
+}
+static bool write_quit_option(bool off) {
+    if (off) return file_write(QUIT_OPTION, "off", 3);
+    return !unlink(QUIT_OPTION) || errno == ENOENT;
+}
+static bool switch_audio2(enum AudioAction action, bool remember) {
+    const char *mode = action == AUDIO_MUSIC ? "music" : "game";
+    bool had_audio = !music_mode;
+    if (action == AUDIO_MUSIC) platform_audio_release();
+    if (!file_write(AUDIO_MODE, mode, strlen(mode))) {
+        if (action == AUDIO_MUSIC && had_audio && game_device[0])
+            (void)platform_audio_open(game_device, game_gain);
+        status("Could not request Q2 audio");
+        return false;
+    }
+    if (action == AUDIO_MUSIC) music_mode = true;
+    pending_action = action;
+    remember_source = remember;
+    audio_request_time = clock_ns();
+    audio_timeout = false;
+    dirty = 1;
+    return true;
+}
+static void yield_player(void) {
+    platform_yield_to_player();
+    physical_keys = pressed_this_frame = touch_keys = 0;
+    held_buttons = gameplay_buttons = 0;
+    native_yielded = true;
+}
+static void resume_from_player(void) {
+    native_yielded = false;
+    last_activity = clock_ns();
+    platform_resume_from_player();
+    physical_keys = pressed_this_frame = touch_keys = 0;
+    held_buttons = gameplay_buttons = 0;
+    menu_focus = 0;
+    dirty = 1;
+}
+static bool audio_arguments(const char *line, char device[16], char volume[8]) {
+    char extra;
+    int fields = sscanf(line, "%15s %7s %c", device, volume, &extra);
+    if (fields == 1) { volume[0] = 0; return !strcmp(device, "plughw:0,0"); }
+    if (fields != 2 || (strcmp(device, "plug:bluealsa") && strcmp(device, "usb"))) return false;
+    const char *digits = volume + (!strcmp(device, "usb") && volume[0] == 'h');
+    return *digits && strlen(digits) <= 3 && strspn(digits, "0123456789") == strlen(digits) &&
+           atoi(digits) <= 100;
+}
+static void audio2_poll(uint64_t now) {
+    if (pending_action) {
+        char reply[48], device[16], volume[8];
+        bool have_reply = read_text(AUDIO_MODE, reply, sizeof reply);
+        if (pending_action == AUDIO_GAME && have_reply && audio_arguments(reply, device, volume)) {
+            pending_action = 0;
+            if (platform_audio_open(device, volume)) {
+                strcpy(game_device, device);
+                strcpy(game_gain, volume);
+                music_mode = false;
+                if (remember_source) store_audio_source(false);
+            } else {
+                (void)switch_audio2(AUDIO_MUSIC, false);
+                status("Could not open game audio");
+            }
+            dirty = 1;
+        } else if (pending_action == AUDIO_MUSIC && !have_reply && errno == ENOENT) {
+            pending_action = 0;
+            if (remember_source) store_audio_source(true);
+            dirty = 1;
+        } else if (!audio_timeout && now - audio_request_time > 5000000000ull) {
+            audio_timeout = true;
+            status("Waiting for Q2 audio. You can exit if it does not respond.");
+        }
+    }
+    if (!native_yielded) return;
+    char view[12];
+    if (read_text(NATIVE_VIEW, view, sizeof view)) {
+        if (!strcmp(view, "open")) { native_request_time = 0; return; }
+        if (!native_request_time || now - native_request_time < 5000000000ull) return;
+        if (unlink(NATIVE_VIEW) && errno != ENOENT) return;
+        status("Could not open Q2 Now Playing");
+    } else if (errno != ENOENT) return;
+    resume_from_player();
+    if (!prefer_music && music_mode && !pending_action) (void)switch_audio2(AUDIO_GAME, false);
+}
 static uint64_t display_deadline(uint64_t now) {
     if (!display_bridge || dimmed || native_yielded || screen == GAME) return UINT64_MAX;
     uint64_t deadline = last_activity + DISPLAY_IDLE_NS;
@@ -600,13 +789,18 @@ static uint64_t display_deadline(uint64_t now) {
 static void request_audio(enum AudioAction action, int value) {
     if (!audio_bridge || pending_action) return;
     bool opening = action == AUDIO_NOW_PLAYING;
-    bool releasing = (action == AUDIO_MUSIC || opening) && !music_mode;
-    if (opening) {
-        platform_yield_to_player();
-        physical_keys = pressed_this_frame = touch_keys = 0;
-        held_buttons = gameplay_buttons = 0;
-        native_yielded = true;
+    if (audio2) {
+        if (!opening) { (void)switch_audio2(action, true); return; }
+        yield_player();
+        if (!file_write(NATIVE_VIEW, "now", 3) || (!music_mode && !switch_audio2(AUDIO_MUSIC, false))) {
+            unlink(NATIVE_VIEW);
+            resume_from_player();
+            status("Could not open Q2 Now Playing");
+        } else native_request_time = clock_ns();
+        return;
     }
+    bool releasing = (action == AUDIO_MUSIC || opening) && !music_mode;
+    if (opening) yield_player();
     if (releasing) platform_audio_release();
     struct AudioCommand command = {AUDIO_MAGIC, ++audio_seq, action, value};
     if (!file_write(AUDIO_REQUEST, &command, sizeof command)) {
@@ -621,11 +815,13 @@ static void request_audio(enum AudioAction action, int value) {
 }
 static uint64_t audio_deadline(void) {
     if (!audio_bridge) return UINT64_MAX;
+    if (audio2 && !pending_action && !native_yielded) return UINT64_MAX;
     return audio_polled + (pending_action || native_yielded || screen == AUDIO ? 75000000ull : 500000000ull);
 }
 static void audio_poll(uint64_t now) {
     if (now < audio_deadline()) return;
     audio_polled = now;
+    if (audio2) { audio2_poll(now); return; }
     struct AudioReply next = {0};
     FILE *file = fopen(AUDIO_REPLY, "rb");
     if (file) {
@@ -638,10 +834,7 @@ static void audio_poll(uint64_t now) {
         bool switched = music_mode != (next.music != 0);
         if (switched) {
             music_mode = next.music != 0;
-            char path[PATH_CAP];
-            const char *mode = music_mode ? "music\n" : "game\n";
-            if (file_path(path, sizeof path, data_dir, "/audio-source.cfg"))
-                (void)file_write(path, mode, strlen(mode));
+            store_audio_source(music_mode);
             if (music_mode) platform_audio_release();
         }
         if (!music_mode && (switched || audio_route != next.route)) {
@@ -654,13 +847,7 @@ static void audio_poll(uint64_t now) {
             if (screen == AUDIO) dirty = 1;
         }
         if (native_yielded && !next.native_ui && !pending_action) {
-            native_yielded = false;
-            last_activity = now;
-            platform_resume_from_player();
-            physical_keys = pressed_this_frame = touch_keys = 0;
-            held_buttons = gameplay_buttons = 0;
-            menu_focus = 0; /* Resume is the first row of the emulator menu. */
-            dirty = 1;
+            resume_from_player();
         }
         if (memcmp(&next, &audio_reply, sizeof next)) {
             audio_reply = next;
@@ -686,8 +873,8 @@ static int write_overlay(char *buffer, size_t remaining, const Button *b) {
 
 static bool write_config(const char *path, const ControlProfile *profile) {
     char buffer[768];
-    int used = snprintf(buffer, sizeof buffer, "%d 9 %d %d %d %d\n",
-                        scaling, fast_rate, local_volume, video_filter, resume_latest);
+    int used = snprintf(buffer, sizeof buffer, "%d 9 %d %d %d %d %d\n",
+                        scaling, fast_rate, local_volume, video_filter, resume_latest, quit_off);
     for (int i = 0; i < TOUCH_X; ++i)
         used += write_overlay(buffer + used, sizeof buffer - used, &profile->overlays[i]);
     for (int i = 0; i < PHYSICAL_COUNT; ++i)
@@ -760,10 +947,12 @@ static bool read_overlay(FILE *f, int version, int row, ControlProfile *profile)
 static void read_config(const char *path, ControlProfile *profile, bool app_settings) {
     FILE *f = fopen(path, "r");
     int saved_scale = FIT, version = 1, rate = 2, volume = 100, saved_filter = SHARP_BILINEAR, resume = 0;
+    int saved_quit_off = 0;
     char line[80];
     if (!f) return;
     if (fgets(line, sizeof line, f))
-        sscanf(line, "%d %d %d %d %d %d", &saved_scale, &version, &rate, &volume, &saved_filter, &resume);
+        sscanf(line, "%d %d %d %d %d %d %d", &saved_scale, &version, &rate, &volume,
+               &saved_filter, &resume, &saved_quit_off);
     if (app_settings) {
         local_volume = clamp(volume, 0, 100);
         platform_audio_attenuation(local_volume);
@@ -771,6 +960,7 @@ static void read_config(const char *path, ControlProfile *profile, bool app_sett
         video_filter = saved_filter == NEAREST ? NEAREST : SHARP_BILINEAR;
         if (rate == 2 || rate == 3 || rate == 5) fast_rate = rate == 5 ? 3 : rate;
         resume_latest = resume == 1;
+        quit_off = saved_quit_off == 1;
     }
     int rows = version < 3 ? (int)(sizeof previous_overlays / sizeof previous_overlays[0]) :
                version < 6 ? TOUCH_A : TOUCH_X;
@@ -924,7 +1114,9 @@ static int latest_state(void) {
 static void set_screen(enum Screen next) {
     if (!smoke && running && (screen == GAME || next == GAME)) platform_audio_reset();
     screen = next;
+    if (screen == GAME) place_game_toggle();
     touching_flow = false;
+    browser_actions_open = false;
     flow_position = shelf->selected;
     flow_started = 0;
     previous_shelf = NULL;
@@ -1253,6 +1445,7 @@ static bool load_rom(const char *path) {
     strcpy(active_rom, path);
     cartridge_saves(false);
     running = 1;
+    game_controls_hidden = false;
     slot = 0;
     fast = 0;
     have_frame = false;
@@ -1350,6 +1543,7 @@ static int menu_items(MenuItem *items) {
         ITEM(15, 95, 345, 40, label, true);
         ITEM(15, 138, 345, 40, filter_label(), true);
         ITEM(15, 181, 345, 40, "Copy control layout", true);
+        ITEM(15, 224, 345, 40, quit_off ? "Force close: Off" : "Force close: Hold Return + Centre", firmware_keys);
         ITEM(15, 267, 345, 40, "Back", true);
         break;
     case COPY_TARGET: case COPY_SOURCE:
@@ -1601,6 +1795,10 @@ static void draw_browser(void) {
     }
     rect(0, 0, WIDTH, BROWSER_BUTTON_Y + 38, SHELF_INK);
     draw_system_indicator();
+    if (!browser_actions_open) {
+        draw_ellipsis(MORE_X + MORE_W / 2, BROWSER_BUTTON_Y + 19);
+        return;
+    }
     char sort[26];
     snprintf(sort, sizeof sort, "Sort: %s", sort_short[library.sort]);
     browser_button(SORT_X, BROWSER_BUTTON_Y, SORT_W, sort, true);
@@ -1763,6 +1961,7 @@ static void draw_ui(void) {
 
 static int hit(int x, int y) {
     if (x < 0 || y < 0 || x >= WIDTH || y >= HEIGHT) return -1;
+    if (screen == GAME && game_controls_hidden) return -1;
     int nearest = -1;
     float best = TOUCH_HIT_PADDING;
     for (int i = CONTROLS - 1; i >= 0; --i) {
@@ -1852,6 +2051,10 @@ static void activate_menu(int index) {
             video_filter = video_filter == SHARP_BILINEAR ? NEAREST : SHARP_BILINEAR;
             store_config();
         } else if (index == 3) set_screen(COPY_TARGET);
+        else if (index == 4) {
+            if (write_quit_option(!quit_off)) { quit_off = !quit_off; store_config(); }
+            else status("Could not set force-close shortcut");
+        }
         else go_back();
         break;
     case COPY_TARGET:
@@ -2053,13 +2256,24 @@ static void browser_touch(char action, int x, int y) {
         return;
     }
     if (abs(dx) > 15 || abs(dy) > 15) return;
-    if (within(x, y, SORT_X, BROWSER_BUTTON_Y, SORT_W)) {
-        set_screen(BROWSER_OPTIONS);
-        menu_focus = library.sort;
-    } else if (within(x, y, EXIT_X, BROWSER_BUTTON_Y, EXIT_W)) go_back();
-    else if (within(x, y, APP_MENU_X, BROWSER_BUTTON_Y, APP_MENU_W)) set_screen(APP_MENU);
-    else if (!shelf_has_games(shelf) || previous_shelf) return;
-    else if (!browser_list() && y >= BROWSER_BUTTON_Y + 38) tap_cover(x, y);
+    if (browser_actions_open) {
+        browser_actions_open = false;
+        dirty = 1;
+        if (within(x, y, SORT_X, BROWSER_BUTTON_Y, SORT_W)) {
+            set_screen(BROWSER_OPTIONS);
+            menu_focus = library.sort;
+        } else if (within(x, y, EXIT_X, BROWSER_BUTTON_Y, EXIT_W)) go_back();
+        else if (within(x, y, APP_MENU_X, BROWSER_BUTTON_Y, APP_MENU_W)) set_screen(APP_MENU);
+        return;
+    }
+    if (within(x, y, MORE_X, BROWSER_BUTTON_Y, MORE_W) &&
+        within(flow_down_x, flow_down_y, MORE_X, BROWSER_BUTTON_Y, MORE_W)) {
+        browser_actions_open = true;
+        dirty = 1;
+        return;
+    }
+    if (!shelf_has_games(shelf) || previous_shelf) return;
+    if (!browser_list() && y >= BROWSER_BUTTON_Y + 38) tap_cover(x, y);
     else if (browser_list()) {
         int row = (y - LIST_TOP) / LIST_ROW;
         int index = list_first() + row;
@@ -2090,6 +2304,14 @@ static void read_touch(char action, int x, int y) {
     if (action != 'd') return;
     switch (screen) {
     case GAME: {
+        if (game_toggle_x >= 0 && x >= game_toggle_x - GAME_TOGGLE_HALF_W &&
+            x < game_toggle_x + GAME_TOGGLE_HALF_W && y >= game_toggle_y - GAME_TOGGLE_HALF_H &&
+            y < game_toggle_y + GAME_TOGGLE_HALF_H) {
+            game_controls_hidden = !game_controls_hidden;
+            touch_keys = 0;
+            touch_button = -1;
+            break;
+        }
         int which = hit(x, y);
         if (which < 0) break;
         touch_button = which;
@@ -2388,6 +2610,36 @@ static int smoke_test(const char *path) {
     const Button *menu = &buttons[MENU_BUTTON];
     int menu_x = menu->x + menu->size / 2, menu_y = menu->y - TOUCH_HIT_PADDING;
     Button saved_b = buttons[B];
+    if (game_toggle_x != WIDTH / 2 || game_toggle_y != GAME_TOGGLE_TOP) { close_rom(); return 45; }
+    /* Only the expanded hit area crosses the default toggle position. */
+    move_button(B, WIDTH / 2 - saved_b.size / 2, GAME_TOGGLE_TOP + GAME_TOGGLE_HALF_H + 3);
+    place_game_toggle();
+    if (game_toggle_x < 0 || (game_toggle_x == WIDTH / 2 && game_toggle_y == GAME_TOGGLE_TOP)) {
+        close_rom(); return 46;
+    }
+    for (int y = game_toggle_y - GAME_TOGGLE_HALF_H; y < game_toggle_y + GAME_TOGGLE_HALF_H; ++y) {
+        for (int x = game_toggle_x - GAME_TOGGLE_HALF_W; x < game_toggle_x + GAME_TOGGLE_HALF_W; ++x) {
+            if (hit(x, y) >= 0) { close_rom(); return 47; }
+        }
+    }
+    buttons[B] = saved_b;
+    place_game_toggle();
+    read_touch('d', game_toggle_x, game_toggle_y);
+    read_touch('u', game_toggle_x, game_toggle_y);
+    read_touch('d', menu_x, menu_y);
+    read_touch('u', menu_x, menu_y);
+    read_touch('d', b->x + b->size / 2, b->y + b->size / 2);
+    read_event((Event){'g', 'd', 116, 0});
+    if (!game_controls_hidden || screen != GAME || touch_keys || physical_keys != KEY(A) ||
+        input_state(0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_MASK) != KEY(A)) {
+        close_rom(); return 48;
+    }
+    read_touch('u', b->x + b->size / 2, b->y + b->size / 2);
+    read_event((Event){'g', 'u', 116, 0});
+    pressed_this_frame = 0;
+    read_touch('d', game_toggle_x, game_toggle_y);
+    read_touch('u', game_toggle_x, game_toggle_y);
+    if (game_controls_hidden) { close_rom(); return 49; }
     int menu_right = menu->x + menu->size;
     int menu_center_y = menu->y + button_height(MENU_BUTTON, menu) / 2;
     buttons[B].x = menu_right + TOUCH_HIT_PADDING;
@@ -2497,6 +2749,30 @@ static int smoke_test(const char *path) {
     schedule_video(clock_ns());
     if (screen != BROWSER || emulation_active() || allow_video || core != previous_core ||
         slot != 3) { close_rom(); return 27; }
+    const int toolbar_y = BROWSER_BUTTON_Y + 13;
+    read_touch('d', EXIT_X + 25, toolbar_y);
+    read_touch('u', EXIT_X + 25, toolbar_y);
+    if (screen != BROWSER || browser_actions_open) { close_rom(); return 40; }
+    read_touch('d', MORE_X + MORE_W / 2, toolbar_y);
+    read_touch('u', MORE_X + MORE_W / 2, toolbar_y);
+    if (!browser_actions_open) { close_rom(); return 41; }
+    read_touch('d', WIDTH / 2, HEIGHT / 2);
+    read_touch('u', WIDTH / 2, HEIGHT / 2);
+    if (screen != BROWSER || browser_actions_open) { close_rom(); return 42; }
+    read_touch('d', MORE_X + MORE_W / 2, toolbar_y);
+    read_touch('u', MORE_X + MORE_W / 2, toolbar_y);
+    read_touch('d', SORT_X + 25, toolbar_y);
+    read_touch('u', SORT_X + 25, toolbar_y);
+    if (screen != BROWSER_OPTIONS || browser_actions_open) { close_rom(); return 43; }
+    go_back();
+    read_touch('d', MORE_X + MORE_W / 2, toolbar_y);
+    read_touch('u', MORE_X + MORE_W / 2, toolbar_y);
+    read_touch('d', APP_MENU_X + 25, toolbar_y);
+    read_touch('u', APP_MENU_X + 25, toolbar_y);
+    if (screen != APP_MENU || browser_actions_open) { close_rom(); return 44; }
+    go_back();
+    read_touch('d', MORE_X + MORE_W / 2, toolbar_y);
+    read_touch('u', MORE_X + MORE_W / 2, toolbar_y);
     read_touch('d', EXIT_X + 25, BROWSER_BUTTON_Y + 13);
     read_touch('u', EXIT_X + 25, BROWSER_BUTTON_Y + 13);
     if (quitting || screen != GAME || !running || core != previous_core ||
@@ -2536,7 +2812,7 @@ static int smoke_test(const char *path) {
     for (int frame = 0; frame < 8; ++frame) core->run();
     if (!smoke_audio_frames) { close_rom(); return 33; }
     close_rom();
-    puts("PASS: ROM, save slots, controls, library pause and resume, speed selection, video budget, audio mute and resume");
+    puts("PASS: ROM, save slots, controls and overlay toggle, library toolbar, pause and resume, speed selection, video budget, audio mute and resume");
     return 0;
 }
 static void write_fatal(int sig) {
@@ -2583,7 +2859,7 @@ static void log_launch(void) {
     sigaction(SIGSEGV, &action, NULL);
     sigaction(SIGABRT, &action, NULL);
     sigaction(SIGFPE, &action, NULL);
-    fprintf(stderr, "\nq2-boy 0.3.5, engine=%s\n",
+    fprintf(stderr, "\nq2-boy 0.3.6, engine=%s\n",
             use_dynarec ? "dynamic recompiler (opt-in)" : "interpreter");
     FILE *memory = fopen("/proc/meminfo", "r");
     if (memory) {
@@ -2608,24 +2884,35 @@ int main(int argc, char **argv) {
         }
     }
     if (!prepare_dirs()) return 1;
+    locate_app(argv[0]);
     if (!smoke) {
         log_launch();
         const char *bridge = getenv("Q2_BOY_AUDIO_BRIDGE");
-        audio_bridge = bridge != NULL;
-        native_supported = bridge && *bridge == '2';
+        char caps[512] = "";
+        if (!read_text(ADDON_CAPS, caps, sizeof caps)) caps[0] = 0;
+        bool supports_audio2 = !bridge && has_cap(caps, "audio2");
+        bool was_audio2 = false;
+        bool manifest_ready = !bridge && enable_manifest_audio(supports_audio2, &was_audio2);
+        audio2 = supports_audio2 && argc == 1;
+        firmware_keys = !bridge && has_cap(caps, "gameview");
+        audio_bridge = bridge != NULL || audio2;
+        native_supported = (bridge && *bridge == '2') || (audio2 && firmware_keys);
         const char *display = getenv("Q2_BOY_DISPLAY_BRIDGE");
         display_bridge = display && !strcmp(display, "1");
-        music_mode = audio_bridge && argc == 1;
+        music_mode = argc == 1 && (audio_bridge || was_audio2);
         audio_route = argc > 1 && !strcmp(argv[1], "plug:bluealsa") ? 1 :
                       argc > 1 && !strcmp(argv[1], "usb") ? (argc > 2 && argv[2][0] == 'h' ? 3 : 2) : 0;
-        if (!platform_open(argc > 1 ? argv[1] : NULL, argc > 2 ? argv[2] : NULL, music_mode)) {
+        if (!platform_open(argc > 1 ? argv[1] : NULL, argc > 2 ? argv[2] : NULL, music_mode, firmware_keys)) {
             fprintf(stderr, "Framebuffer or input socket initialization failed: %s\n", strerror(errno));
             platform_close();
             return 1;
         }
+        if (supports_audio2 && argc > 1)
+            status(manifest_ready ? "Reopen Pocket Boy to enable Q2 music" : "Could not enable Q2 music on the card");
+        else if (!supports_audio2 && was_audio2)
+            status(manifest_ready ? "Reopen Pocket Boy to enable game audio" : "Could not restore game audio on the card");
     }
     load_config();
-    locate_app(argv[0]);
     initialize_palette();
     if (smoke) {
         int result = smoke_test(argv[2]);
@@ -2634,7 +2921,15 @@ int main(int argc, char **argv) {
         close_shared_cores();
         return result;
     }
-    if (!raw_buttons && !native_supported) status("Limited input: holding Up may exit");
+    if (firmware_keys && !write_quit_option(quit_off)) status("Could not set force-close shortcut");
+    if (audio2) {
+        char path[PATH_CAP], mode[24];
+        prefer_music = file_path(path, sizeof path, data_dir, "/audio-source.cfg") &&
+                       read_text(path, mode, sizeof mode) && has_cap(mode, "music");
+        if (!prefer_music) (void)switch_audio2(AUDIO_GAME, false);
+    }
+    if (!raw_buttons && !native_supported && !firmware_keys && !notice_end)
+        status("Limited input: holding Up may exit");
     load_library();
     load_favorites();
     library_migrate(&data_paths);
