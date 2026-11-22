@@ -2908,7 +2908,7 @@ static void log_launch(void) {
     sigaction(SIGSEGV, &action, NULL);
     sigaction(SIGABRT, &action, NULL);
     sigaction(SIGFPE, &action, NULL);
-    fprintf(stderr, "\nq2-boy 0.3.7, engine=%s\n",
+    fprintf(stderr, "\nq2-boy 0.3.8, engine=%s\n",
             use_dynarec ? "dynamic recompiler (opt-in)" : "interpreter");
     FILE *memory = fopen("/proc/meminfo", "r");
     if (memory) {
@@ -2957,9 +2957,9 @@ int main(int argc, char **argv) {
             return 1;
         }
         if (supports_audio2 && argc > 1)
-            status(manifest_ready ? "Reopen Pocket Boy to enable Q2 music" : "Could not enable Q2 music on the card");
+            status(manifest_ready ? "Exit Pocket Boy, back out of Games, then reopen it" : "Could not enable Q2 music on the card");
         else if (!supports_audio2 && was_audio2)
-            status(manifest_ready ? "Reopen Pocket Boy to enable game audio" : "Could not restore game audio on the card");
+            status(manifest_ready ? "Exit Pocket Boy, back out of Games, then reopen it" : "Could not restore game audio on the card");
     }
     load_config();
     initialize_palette();

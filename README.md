@@ -17,11 +17,14 @@ All systems share the same menus, display options, save slots, and 2×/3×
 fast-forward settings. Actual fast-forward speed depends on the game.
 The archive includes no commercial ROMs or Nintendo BIOS files.
 
-The Q2-Pod 1.8.8 card-game launcher supports emulation, game audio, save
-states, and fast-forward. Background music uses the
-[Q2-Pod audio interface](https://github.com/DiamondBond/q2-pod/pull/426).
-When first upgrading to firmware with that interface, open Pocket Boy,
-exit, and open it again to enable the new audio options.
+On standard [Q2-Pod 1.9.0](https://github.com/DiamondBond/q2-pod/releases/tag/1.9.0),
+Pocket Boy supports Q2 Music and Q2 Now Playing on the first launch. If you
+replace the app while Games is open, back out to Library and re-enter Games
+so Q2-Pod reads the new launcher settings.
+
+On Q2-Pod 1.8.8, Pocket Boy supports emulation, game audio, save states, and
+fast-forward. If prompted on first launch, exit Pocket Boy, back out to
+Library, then re-enter Games and launch Pocket Boy again to enable game audio.
 
 ## Install on the Q2
 
