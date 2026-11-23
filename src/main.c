@@ -40,7 +40,7 @@
 
 enum Screen {
     BROWSER, GAME, MENU, STATES, SETTINGS, EDIT, CONFIRM, AUDIO, PHYSICAL, TOUCH, ASSIGN,
-    BROWSER_OPTIONS, APP_MENU, COPY_TARGET, COPY_SOURCE, GET_GAMES, ITCH_GAME, ITCH_QR,
+    BROWSER_OPTIONS, APP_MENU, COPY_TARGET, COPY_SOURCE, GET_GAMES, ITCH_FILTERS, ITCH_SEARCH, ITCH_GAME, ITCH_QR,
     ROM_ACTIONS, DELETE_ROM, CONFIRM_DELETE
 };
 enum Scale { FIT, CROP, STRETCH, INTEGER_SCALE, SCALE_COUNT };
@@ -191,6 +191,7 @@ static enum CartridgeSystem active_system = SYSTEM_GBA;
 typedef struct {
     char name[256];
     int title_length, recent_rank;
+    uint64_t itch_id;
     enum CartridgeSystem system;
     bool legacy;
 } Rom;
@@ -218,10 +219,25 @@ enum ItchAction { ITCH_LIST, ITCH_INFO, ITCH_DOWNLOAD, ITCH_LINK };
 static ItchJob itch_job;
 static enum ItchAction itch_action;
 static ItchGame itch_games[ITCH_LIMIT];
-static int itch_system = SYSTEM_GBA, itch_filter, itch_feed = 1, itch_offset, itch_count, itch_selected;
+enum { ITCH_PAGE_LIMIT = 100, ITCH_QUERY_SIZE = 49, ITCH_KEY_COUNT = 36 };
+typedef struct { int console, price, genre, order; } ItchFilters;
+static ItchFilters itch_options = {.console = SYSTEM_GBA}, itch_draft;
+static int itch_default_console = SYSTEM_GBA;
+static int itch_feed = 1, itch_page, itch_history[ITCH_PAGE_LIMIT], itch_offset, itch_count, itch_selected;
 static const char *const itch_systems[] = {"gb", "gbc", "gba"};
-static const char *const itch_filters[] = {"all", "free", "paid"};
-static const char *const itch_filter_labels[] = {"All", "Free", "Paid"};
+static const char *const itch_prices[] = {"all", "free", "paid"};
+static const char *const itch_price_labels[] = {"All", "Free", "Paid"};
+static const char *const itch_genres[] = {
+    "all", "action", "adventure", "platformer", "puzzle", "rpg", "shooter", "simulation", "strategy"
+};
+static const char *const itch_genre_labels[] = {
+    "All", "Action", "Adventure", "Platformer", "Puzzle", "RPG", "Shooter", "Simulation", "Strategy"
+};
+static const char *const itch_orders[] = {"popular", "newest", "top-rated"};
+static const char *const itch_order_labels[] = {"Popular", "Newest", "Top Rated"};
+static const char itch_keys[] = "1234567890qwertyuiopasdfghjklzxcvbnm";
+static char itch_query[ITCH_QUERY_SIZE], itch_query_draft[ITCH_QUERY_SIZE];
+static bool itch_more, itch_search_interrupted;
 static char itch_game_price[27], itch_suggested[22], itch_message[95];
 static unsigned char itch_qr_grid[ITCH_QR_LIMIT][ITCH_QR_LIMIT];
 static int itch_qr_size;
@@ -1335,11 +1351,14 @@ static void scan_rom_directory(const char *directory, enum CartridgeSystem expec
         Rom *rom = &roms[rom_count++];
         strcpy(rom->name, name);
         rom->title_length = (int)(strrchr(rom->name, '.') - rom->name);
+        rom->itch_id = 0;
         const char *itch_id = strrchr(rom->name, '[');
         if (itch_id && itch_id > rom->name + 1 && itch_id[-1] == ' ' && !strncmp(itch_id, "[itch ", 6)) {
             size_t digits = strspn(itch_id + 6, "0123456789");
-            if (digits && itch_id + 6 + digits == rom->name + rom->title_length - 1 && itch_id[6 + digits] == ']')
+            if (digits && itch_id + 6 + digits == rom->name + rom->title_length - 1 && itch_id[6 + digits] == ']') {
                 rom->title_length = (int)(itch_id - rom->name - 1);
+                rom->itch_id = strtoull(itch_id + 6, NULL, 10);
+            }
         }
         rom->system = system;
         rom->legacy = legacy;
@@ -1376,6 +1395,18 @@ static void delete_selected(void) {
                                           : delete_saves ? "ROM and save data deleted" : "ROM deleted. Saves kept");
 }
 
+static bool itch_installed(const ItchGame *game) {
+    if (!game->id) return false;
+    for (int i = 0; i < rom_count; ++i) {
+        const Rom *rom = &roms[i];
+        char path[PATH_CAP];
+        struct stat64 st;
+        if (rom->itch_id == game->id && join_path(path, rom_directory(rom), rom->name) &&
+            !stat64(path, &st) && S_ISREG(st.st_mode)) return true;
+    }
+    return false;
+}
+
 static bool start_itch(enum ItchAction action) {
     if (smoke) return false;
     char helper[PATH_CAP];
@@ -1383,16 +1414,19 @@ static bool start_itch(enum ItchAction action) {
     char number[8];
     snprintf(number, sizeof number, "%d", itch_feed);
     const char *const commands[] = {"list", "info", "download", "qr"};
-    char *arguments[] = {helper, (char *)commands[action], NULL, NULL, NULL, NULL};
+    char *arguments[9] = {helper, (char *)commands[action]};
     if (action == ITCH_LIST) {
-        arguments[2] = (char *)itch_systems[itch_system];
-        arguments[3] = (char *)itch_filters[itch_filter];
-        arguments[4] = number;
+        arguments[2] = (char *)itch_systems[itch_options.console];
+        arguments[3] = (char *)itch_prices[itch_options.price];
+        arguments[4] = (char *)itch_genres[itch_options.genre];
+        arguments[5] = (char *)itch_orders[itch_options.order];
+        arguments[6] = number;
+        arguments[7] = itch_query;
     } else {
         arguments[2] = itch_games[itch_selected].url;
         if (action == ITCH_DOWNLOAD) {
             arguments[3] = data_paths.roms;
-            arguments[4] = (char *)itch_systems[itch_system];
+            arguments[4] = (char *)itch_systems[itch_options.console];
         }
     }
     if (!itch_start(&itch_job, helper, arguments)) {
@@ -1408,11 +1442,19 @@ static bool start_itch(enum ItchAction action) {
 }
 
 static void load_itch_page(int feed, bool end) {
-    itch_feed = clamp(feed, 1, 100);
+    itch_feed = clamp(feed, 1, ITCH_PAGE_LIMIT);
+    itch_more = false;
     itch_count = itch_offset = 0;
     itch_skip_to_end = end;
     itch_list_failed = !start_itch(ITCH_LIST);
     menu_focus = 0;
+}
+
+static void restart_itch_catalog(void) {
+    itch_search_interrupted = false;
+    itch_page = 0;
+    set_screen(GET_GAMES);
+    load_itch_page(1, false);
 }
 
 static uint64_t update_itch(uint64_t now) {
@@ -1435,10 +1477,16 @@ static uint64_t update_itch(uint64_t now) {
     case ITCH_LIST:
         itch_list_failed = !ok;
         if (ok) {
-            itch_count = itch_catalog(result, itch_games);
+            itch_count = itch_catalog(result, itch_games, &itch_more);
+            if (!itch_count && itch_more && itch_feed < ITCH_PAGE_LIMIT) {
+                load_itch_page(itch_feed + 1, itch_skip_to_end);
+                return now + 50000000ull;
+            }
+            itch_history[itch_page] = itch_feed;
             if (itch_skip_to_end && itch_count) itch_offset = (itch_count - 1) / ROWS * ROWS;
             if (itch_count) menu_focus = 2;
-            else snprintf(itch_message, sizeof itch_message, "No projects on this page");
+            else snprintf(itch_message, sizeof itch_message, "%s",
+                          itch_page ? "No more matching ROMs" : "No matching ROMs");
         }
         break;
     case ITCH_INFO:
@@ -1625,6 +1673,7 @@ static void finish_rom(bool save) {
 }
 static void close_rom(void) { finish_rom(true); }
 typedef struct { int x, y, w, h; bool enabled; char label[96]; } MenuItem;
+enum { MENU_ITEM_LIMIT = ITCH_KEY_COUNT + 5 };
 static const char *const picture_modes[SCALE_COUNT] = {
     "Original aspect", "Crop to fill", "Stretch to fill", "Integer Scale"
 };
@@ -1653,18 +1702,40 @@ static int menu_items(MenuItem *items) {
         ITEM(285, 261, 75, 45, "Back", true);
         break;
     case GET_GAMES:
-        snprintf(label, sizeof label, "Console: %s", system_short[itch_system]);
-        ITEM(15, 55, 171, 32, label, !itch_job.pid);
-        snprintf(label, sizeof label, "Show: %s", itch_filter_labels[itch_filter]);
-        ITEM(190, 55, 170, 32, label, !itch_job.pid);
+        ITEM(15, 55, 171, 32, "Search", true);
+        ITEM(190, 55, 170, 32, "Filters", true);
         for (int row = 0; row < ROWS; ++row) {
             int i = itch_offset + row;
             ITEM(15, 91 + row * 34, 345, 31, i < itch_count ? itch_games[i].title : "", i < itch_count && !itch_job.pid);
         }
-        ITEM(15, 267, 109, 40, "Previous", !itch_job.pid && (itch_offset > 0 || itch_feed > 1));
+        ITEM(15, 267, 109, 40, "Previous", !itch_job.pid && (itch_offset > 0 || itch_page > 0));
         ITEM(128, 267, 113, 40, itch_list_failed ? "Retry" : "Next",
-             !itch_job.pid && (itch_list_failed || (itch_count && (itch_offset + ROWS < itch_count || itch_feed < 100))));
+             !itch_job.pid && (itch_list_failed || (itch_count && (itch_offset + ROWS < itch_count || itch_more))));
         ITEM(245, 267, 115, 40, "Back", true);
+        break;
+    case ITCH_FILTERS:
+        snprintf(label, sizeof label, "Console: %s", system_short[itch_draft.console]);
+        ITEM(15, 55, 345, 43, label, true);
+        snprintf(label, sizeof label, "Price: %s", itch_price_labels[itch_draft.price]);
+        ITEM(15, 104, 345, 43, label, true);
+        snprintf(label, sizeof label, "Genre: %s", itch_genre_labels[itch_draft.genre]);
+        ITEM(15, 153, 345, 43, label, true);
+        snprintf(label, sizeof label, "Sort by: %s", itch_order_labels[itch_draft.order]);
+        ITEM(15, 202, 345, 43, label, true);
+        ITEM(15, 264, 119, 43, "Clear filters", true);
+        ITEM(138, 264, 108, 43, "Apply", true);
+        ITEM(250, 264, 110, 43, "Back", true);
+        break;
+    case ITCH_SEARCH:
+        for (int i = 0; i < ITCH_KEY_COUNT; ++i) {
+            char key[] = {itch_keys[i], 0};
+            ITEM(14 + i % 10 * 35, 86 + i / 10 * 41, 32, 36, key, true);
+        }
+        ITEM(224, 209, 67, 36, "Space", true);
+        ITEM(294, 209, 67, 36, "Erase", true);
+        ITEM(15, 264, 109, 43, "Clear", true);
+        ITEM(128, 264, 113, 43, "Search", true);
+        ITEM(245, 264, 115, 43, "Back", true);
         break;
     case ITCH_GAME:
         ITEM(15, 137, 345, 39, "Download ROM", itch_free && !itch_job.pid);
@@ -2024,17 +2095,31 @@ static void draw_ui(void) {
         header("Pocket Boy", "Library settings and games");
         break;
     case GET_GAMES:
-        snprintf(sub, sizeof sub, "itch.io  |  Page %d.%d", itch_feed, itch_offset / ROWS + 1);
+        if (*itch_query) snprintf(sub, sizeof sub, "%s | %.48s", system_short[itch_options.console], itch_query);
+        else snprintf(sub, sizeof sub, "%s | %s | %s | %s", system_short[itch_options.console],
+                      itch_price_labels[itch_options.price], itch_genre_labels[itch_options.genre],
+                      itch_order_labels[itch_options.order]);
         header("Get Games", sub);
+        if (itch_job.pid) snprintf(label, sizeof label, "Checking itch.io page %d for ROMs...", itch_feed);
         if (itch_job.pid || *itch_message)
-            text_at(19, 245, itch_job.pid ? "Loading itch.io catalog..." : itch_message, ACCENT, WIDTH - 15);
+            text_at(19, 245, itch_job.pid ? label : itch_message, ACCENT, WIDTH - 15);
+        break;
+    case ITCH_FILTERS:
+        header("Filters", "Tap an option to cycle through choices");
+        break;
+    case ITCH_SEARCH:
+        header("Search games", "Title or creator");
+        rect(15, 51, 345, 31, RGB(0x16282b));
+        text_at(23, 58, *itch_query_draft ? itch_query_draft : "Enter a title or creator",
+                *itch_query_draft ? WHITE : GRAY, WIDTH - 22);
         break;
     case ITCH_GAME: {
         const ItchGame *game = &itch_games[itch_selected];
         header(game->title, game->creator);
         snprintf(sub, sizeof sub, "%s%s%s", itch_game_price, *itch_suggested ? "  |  Suggested " : "", itch_suggested);
         text_at(17, 63, sub, WHITE, WIDTH - 15);
-        if (!itch_free && !itch_job.pid && !*itch_message)
+        if (itch_installed(game)) text_at(17, 94, "Installed", ACCENT, WIDTH - 15);
+        else if (!itch_free && !itch_job.pid && !*itch_message)
             text_at(17, 94, "Open itch.io on your phone", GRAY, WIDTH - 15);
         if (itch_job.pid || *itch_message) {
             const char *message = itch_action == ITCH_DOWNLOAD ? "Downloading ROM and cover..." : "Checking itch.io...";
@@ -2120,7 +2205,7 @@ static void draw_ui(void) {
                                              : "Unsaved progress in this session will be lost.");
         break;
     }
-    MenuItem items[10];
+    MenuItem items[MENU_ITEM_LIMIT];
     int count = menu_items(items);
     for (int i = 0; i < count; ++i) {
         const MenuItem *m = &items[i];
@@ -2129,8 +2214,13 @@ static void draw_ui(void) {
         uint32_t fill = focused ? RGB(0x245448) : RGB(0x16282b);
         rect(m->x, m->y, m->w, m->h, fill);
         if (focused) rect(m->x, m->y, 4, m->h, ACCENT);
-        text_at(m->x + 11, m->y + (m->h - 17) / 2, m->label, m->enabled ? WHITE : GRAY,
-                m->x + m->w - 6);
+        int text_end = m->x + m->w - 6;
+        if (screen == GET_GAMES && i >= 2 && i < 2 + ROWS &&
+            itch_installed(&itch_games[itch_offset + i - 2])) {
+            text_at(276, m->y + (m->h - 17) / 2, "Installed", ACCENT, text_end);
+            text_end = 269;
+        }
+        text_at(m->x + 11, m->y + (m->h - 17) / 2, m->label, m->enabled ? WHITE : GRAY, text_end);
     }
     if (notice_end && clock_ns() < notice_end) {
         rect(37, HEIGHT - 29, WIDTH - 74, 23, DARK);
@@ -2174,6 +2264,13 @@ static void go_back(void) {
     case GET_GAMES:
         itch_stop(&itch_job);
         set_screen(BROWSER);
+        break;
+    case ITCH_FILTERS: case ITCH_SEARCH:
+        set_screen(GET_GAMES);
+        if (itch_search_interrupted) {
+            itch_search_interrupted = false;
+            load_itch_page(itch_feed, itch_skip_to_end);
+        }
         break;
     case ITCH_GAME:
         if (itch_job.pid && itch_action == ITCH_DOWNLOAD) {
@@ -2237,7 +2334,7 @@ static void pick_system(int direction) {
 }
 
 static void activate_menu(int index) {
-    MenuItem items[10];
+    MenuItem items[MENU_ITEM_LIMIT];
     int count = menu_items(items);
     if (index < 0 || index >= count || !items[index].enabled) return;
     menu_focus = index;
@@ -2257,10 +2354,16 @@ static void activate_menu(int index) {
         else go_back();
         break;
     case GET_GAMES:
-        if (index == 0 || index == 1) {
-            if (!index) itch_system = (itch_system + 1) % 3;
-            else itch_filter = (itch_filter + 1) % 3;
-            load_itch_page(1, false);
+        if (index <= 1 && itch_job.pid) {
+            itch_stop(&itch_job);
+            itch_search_interrupted = true;
+        }
+        if (index == 0) {
+            strcpy(itch_query_draft, itch_query);
+            set_screen(ITCH_SEARCH);
+        } else if (index == 1) {
+            itch_draft = itch_options;
+            set_screen(ITCH_FILTERS);
         } else if (index < 2 + ROWS) {
             itch_selected = itch_offset + index - 2;
             itch_free = false;
@@ -2271,13 +2374,39 @@ static void activate_menu(int index) {
             (void)start_itch(ITCH_INFO);
         } else if (index == 2 + ROWS) {
             if (itch_offset > 0) { itch_offset -= ROWS; menu_focus = 2; }
-            else load_itch_page(itch_feed - 1, true);
+            else load_itch_page(itch_history[--itch_page], true);
         } else if (index == 3 + ROWS) {
-            if (itch_list_failed) load_itch_page(itch_feed, false);
+            if (itch_list_failed) load_itch_page(itch_feed, itch_skip_to_end);
             else if (itch_offset + ROWS < itch_count) { itch_offset += ROWS; menu_focus = 2; }
-            else load_itch_page(itch_feed + 1, false);
+            else if (itch_page + 1 < ITCH_PAGE_LIMIT) {
+                ++itch_page;
+                load_itch_page(itch_feed + 1, false);
+            }
         } else go_back();
         break;
+    case ITCH_FILTERS:
+        if (index == 0) itch_draft.console = (itch_draft.console + 1) % 3;
+        else if (index == 1) itch_draft.price = (itch_draft.price + 1) % 3;
+        else if (index == 2) itch_draft.genre = (itch_draft.genre + 1) % (sizeof itch_genres / sizeof itch_genres[0]);
+        else if (index == 3) itch_draft.order = (itch_draft.order + 1) % 3;
+        else if (index == 4) itch_draft = (ItchFilters){.console = itch_default_console};
+        else if (index == 5) { itch_options = itch_draft; restart_itch_catalog(); }
+        else go_back();
+        break;
+    case ITCH_SEARCH: {
+        size_t length = strlen(itch_query_draft);
+        if (index <= ITCH_KEY_COUNT && length + 1 < sizeof itch_query_draft) {
+            itch_query_draft[length] = index < ITCH_KEY_COUNT ? itch_keys[index] : ' ';
+            itch_query_draft[length + 1] = 0;
+        } else if (index == ITCH_KEY_COUNT + 1 && length) itch_query_draft[length - 1] = 0;
+        else if (index == ITCH_KEY_COUNT + 2) itch_query_draft[0] = 0;
+        else if (index == ITCH_KEY_COUNT + 3) {
+            while (length && itch_query_draft[length - 1] == ' ') itch_query_draft[--length] = 0;
+            strcpy(itch_query, itch_query_draft + strspn(itch_query_draft, " "));
+            restart_itch_catalog();
+        } else if (index == ITCH_KEY_COUNT + 4) go_back();
+        break;
+    }
     case ITCH_GAME:
         if (index == 0) {
             if (rom_count >= ROM_LIMIT) status("ROM library is full");
@@ -2424,7 +2553,7 @@ static void activate_menu(int index) {
     dirty = 1;
 }
 static void tap_menu(int x, int y) {
-    MenuItem items[10];
+    MenuItem items[MENU_ITEM_LIMIT];
     int count = menu_items(items);
     for (int i = 0; i < count; ++i) {
         const MenuItem *m = &items[i];
@@ -2435,7 +2564,7 @@ static void tap_menu(int x, int y) {
     }
 }
 static void step_menu(int step) {
-    MenuItem items[10];
+    MenuItem items[MENU_ITEM_LIMIT];
     int count = menu_items(items);
     if (!count) return;
     do { menu_focus = (menu_focus + step + count) % count; } while (!items[menu_focus].enabled);
@@ -2566,9 +2695,10 @@ static void browser_touch(char action, int x, int y) {
             menu_focus = library.sort;
         } else if (within(x, y, GET_GAMES_X, BROWSER_BUTTON_Y, GET_GAMES_W)) {
             int current = (int)(shelf - shelves);
-            if (current <= SYSTEM_GBA) itch_system = current;
-            set_screen(GET_GAMES);
-            load_itch_page(1, false);
+            if (current <= SYSTEM_GBA) itch_default_console = current;
+            if (!smoke) scan_roms();
+            itch_options.console = itch_default_console;
+            restart_itch_catalog();
         } else if (within(x, y, APP_MENU_X, BROWSER_BUTTON_Y, APP_MENU_W)) set_screen(APP_MENU);
         return;
     }
@@ -2656,7 +2786,7 @@ static void read_touch(char action, int x, int y) {
     case GAME: case BROWSER: break; /* Handled above to distinguish taps from swipes. */
     case MENU: case STATES: case SETTINGS: case CONFIRM: case AUDIO: case PHYSICAL: case TOUCH:
     case ASSIGN: case BROWSER_OPTIONS: case APP_MENU: case COPY_TARGET: case COPY_SOURCE:
-    case GET_GAMES: case ITCH_GAME: case ITCH_QR: case ROM_ACTIONS: case DELETE_ROM: case CONFIRM_DELETE:
+    case GET_GAMES: case ITCH_FILTERS: case ITCH_SEARCH: case ITCH_GAME: case ITCH_QR: case ROM_ACTIONS: case DELETE_ROM: case CONFIRM_DELETE:
         tap_menu(x, y);
         break;
     case EDIT: {
@@ -3197,6 +3327,35 @@ static int smoke_test(const char *path) {
     read_touch('d', GET_GAMES_X + 25, BROWSER_BUTTON_Y + 13);
     read_touch('u', GET_GAMES_X + 25, BROWSER_BUTTON_Y + 13);
     if (quitting || screen != GET_GAMES || !running) { close_rom(); return 29; }
+    ItchFilters saved_filters = itch_options;
+    activate_menu(1);
+    if (screen != ITCH_FILTERS) { close_rom(); return 65; }
+    activate_menu(0);
+    activate_menu(1);
+    activate_menu(2);
+    activate_menu(3);
+    activate_menu(5);
+    if (screen != GET_GAMES || itch_options.console == saved_filters.console ||
+        itch_options.price == saved_filters.price || itch_options.genre == saved_filters.genre ||
+        itch_options.order == saved_filters.order) { close_rom(); return 66; }
+    itch_options = saved_filters;
+    activate_menu(0);
+    if (screen != ITCH_SEARCH) { close_rom(); return 67; }
+    activate_menu(10); /* q */
+    activate_menu(ITCH_KEY_COUNT + 3);
+    if (screen != GET_GAMES || strcmp(itch_query, "q")) { close_rom(); return 68; }
+    itch_query[0] = 0;
+    char entry[] = "P 1\n42\tTest Game\tCreator\tFree\thttps://creator.itch.io/test\n";
+    char test_rom[PATH_CAP];
+    const char test_name[] = "Test Game [itch 42].gba";
+    if (itch_catalog(entry, itch_games, &itch_more) != 1 || !itch_more ||
+        !join_path(test_rom, data_paths.system_roms[SYSTEM_GBA], test_name) ||
+        !file_write(test_rom, "rom", 3)) { close_rom(); return 69; }
+    scan_roms();
+    if (!itch_installed(&itch_games[0]) ||
+        library_remove_rom(&data_paths, test_name, false, false, SLOTS) != ROM_REMOVED ||
+        itch_installed(&itch_games[0])) { close_rom(); return 70; }
+    scan_roms();
     go_back();
     set_screen(APP_MENU);
     activate_menu(6);
@@ -3286,7 +3445,7 @@ static void log_launch(void) {
     sigaction(SIGSEGV, &action, NULL);
     sigaction(SIGABRT, &action, NULL);
     sigaction(SIGFPE, &action, NULL);
-    fprintf(stderr, "\nq2-boy 0.4.0, engine=%s\n",
+    fprintf(stderr, "\nq2-boy 0.4.1, engine=%s\n",
             use_dynarec ? "dynamic recompiler (opt-in)" : "interpreter");
     FILE *memory = fopen("/proc/meminfo", "r");
     if (memory) {

@@ -8,7 +8,6 @@ import (
 	"bytes"
 	"encoding/base64"
 	"encoding/json"
-	"encoding/xml"
 	"errors"
 	"fmt"
 	"image"
@@ -37,7 +36,7 @@ import (
 const maxROM = 32 << 20
 const maxArchive = 48 << 20
 const maxPage = 2 << 20
-const agent = "PocketBoy/0.4.0 (https://github.com/SlayTheEarth/q2-boy)"
+const agent = "PocketBoy/0.4.1 (https://github.com/SlayTheEarth/q2-boy)"
 
 var (
 	errVisit   = errors.New("Open the itch.io page for this download")
@@ -158,57 +157,6 @@ func priceLabel(raw string) string {
 	return s
 }
 
-func list(c *http.Client, system, filter string, number int, output io.Writer) error {
-	slugs := map[string]string{"gb": "tag-gameboy-rom", "gbc": "tag-gameboy-color", "gba": "tag-gameboy-advance"}
-	slug := slugs[system]
-	if slug == "" || number < 1 || number > 100 {
-		return errVisit
-	}
-	prefix := "https://itch.io/games/"
-	switch filter {
-	case "all":
-	case "free", "paid":
-		prefix += filter + "/"
-	default:
-		return errVisit
-	}
-	res, err := fetch(c, fmt.Sprintf("%s%s.xml?page=%d", prefix, slug, number), nil, "")
-	if err != nil {
-		return err
-	}
-	defer res.Body.Close()
-	var feed struct {
-		Items []struct {
-			Title string `xml:"title"`
-			Plain string `xml:"plainTitle"`
-			Link  string `xml:"link"`
-			Price string `xml:"price"`
-		} `xml:"channel>item"`
-	}
-	decoder := xml.NewDecoder(io.LimitReader(res.Body, maxPage))
-	if decoder.Decode(&feed) != nil {
-		return errors.New("Could not read the itch.io catalog")
-	}
-	seen := make(map[string]bool)
-	for _, item := range feed.Items {
-		u, ok := project(item.Link)
-		if !ok || seen[item.Link] || len(item.Link) >= 250 {
-			continue
-		}
-		seen[item.Link] = true
-		title := item.Plain
-		if title == "" {
-			title = item.Title
-		}
-		fmt.Fprintf(output, "%s\t%s\t%s\t%s\n", clean(title, 95),
-			clean(strings.TrimSuffix(u.Hostname(), ".itch.io"), 45), priceLabel(item.Price), item.Link)
-		if len(seen) >= 80 {
-			break
-		}
-	}
-	return nil
-}
-
 type gameData struct {
 	ID        int64  `json:"id"`
 	Title     string `json:"title"`
@@ -271,7 +219,7 @@ func uploads(doc []byte) []upload {
 		for child := n.FirstChild; child != nil; child = child.NextSibling {
 			walk(child, item)
 		}
-		if outer && entry.id != "" && entry.name != "" {
+		if outer && entry.name != "" {
 			out = append(out, entry)
 		}
 	}
@@ -377,7 +325,6 @@ func romReader(file *os.File, size int64, ext, preferred string) (io.ReadCloser,
 				return io.NopCloser(file), ext, nil
 			}
 		}
-		return nil, "", errNoROM
 	}
 	z, err := zip.NewReader(file, size)
 	if err != nil {
@@ -531,6 +478,16 @@ func cover(c *http.Client, address string) ([]byte, error) {
 	return pngFile.Bytes(), err
 }
 
+func uploadKind(name string) string {
+	if strings.EqualFold(path.Ext(name), ".zip") {
+		return ".zip"
+	}
+	if system := uploadConsole(name); system != "" {
+		return "." + system
+	}
+	return ""
+}
+
 func download(c *http.Client, base, dirs, preferred string, output io.Writer) error {
 	data, err := metadata(c, base)
 	if err != nil {
@@ -559,7 +516,7 @@ func download(c *http.Client, base, dirs, preferred string, output io.Writer) er
 		return err
 	}
 	priority := func(file upload) int {
-		switch strings.ToLower(filepath.Ext(file.name)) {
+		switch uploadKind(file.name) {
 		case preferred:
 			return 0
 		case ".zip":
@@ -573,8 +530,8 @@ func download(c *http.Client, base, dirs, preferred string, output io.Writer) er
 	var blocked bool
 	attempts := 0
 	for _, file := range files {
-		kind := strings.ToLower(filepath.Ext(file.name))
-		if !supported(kind) && kind != ".zip" {
+		kind := uploadKind(file.name)
+		if file.id == "" || (!supported(kind) && kind != ".zip") {
 			continue
 		}
 		attempts++
@@ -636,9 +593,9 @@ func saveCover(c *http.Client, address, dir, stem string) bool {
 
 func run(args []string, output io.Writer) error {
 	c := newClient()
-	if len(args) == 4 && args[0] == "list" {
-		n, _ := strconv.Atoi(args[3])
-		return list(c, args[1], args[2], n, output)
+	if len(args) == 7 && args[0] == "list" {
+		n, _ := strconv.Atoi(args[5])
+		return list(c, args[1], args[2], args[3], args[4], n, args[6], output)
 	}
 	if len(args) < 2 {
 		return errVisit

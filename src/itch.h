@@ -4,6 +4,7 @@
 
 #include <stdbool.h>
 #include <stddef.h>
+#include <stdint.h>
 #include <sys/types.h>
 
 #define ITCH_LIMIT 80
@@ -11,6 +12,7 @@
 #define ITCH_QR_LIMIT 73
 
 typedef struct {
+    uint64_t id;
     char title[96], creator[46], price[27], url[250];
 } ItchGame;
 
@@ -24,7 +26,7 @@ typedef struct {
 bool itch_start(ItchJob *job, const char *helper, char *const arguments[]);
 bool itch_finished(ItchJob *job, bool *success);
 void itch_stop(ItchJob *job);
-int itch_catalog(char *result, ItchGame games[ITCH_LIMIT]);
+int itch_catalog(char *result, ItchGame games[ITCH_LIMIT], bool *more);
 int itch_qr(char *result, unsigned char grid[ITCH_QR_LIMIT][ITCH_QR_LIMIT]);
 
 #endif

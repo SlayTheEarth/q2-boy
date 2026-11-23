@@ -3,6 +3,7 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <inttypes.h>
 #include <signal.h>
 #include <stdio.h>
 #include <string.h>
@@ -73,14 +74,19 @@ void itch_stop(ItchJob *job) {
     job->pid = 0;
 }
 
-int itch_catalog(char *result, ItchGame games[ITCH_LIMIT]) {
+int itch_catalog(char *result, ItchGame games[ITCH_LIMIT], bool *more) {
+    *more = false;
     int count = 0;
     char *save = NULL;
-    for (char *line = strtok_r(result, "\n", &save); line && count < ITCH_LIMIT;
+    char *line = strtok_r(result, "\n", &save);
+    if (!line || (strcmp(line, "P 0") && strcmp(line, "P 1"))) return 0;
+    *more = line[2] == '1';
+    for (line = strtok_r(NULL, "\n", &save); line && count < ITCH_LIMIT;
          line = strtok_r(NULL, "\n", &save)) {
         ItchGame entry = {0};
-        if (sscanf(line, "%95[^\t]\t%45[^\t]\t%26[^\t]\t%249[^\t]",
-                   entry.title, entry.creator, entry.price, entry.url) == 4) games[count++] = entry;
+        if (sscanf(line, "%" SCNu64 "\t%95[^\t]\t%45[^\t]\t%26[^\t]\t%249[^\t]",
+                   &entry.id, entry.title, entry.creator, entry.price, entry.url) == 5 &&
+            entry.id) games[count++] = entry;
     }
     return count;
 }

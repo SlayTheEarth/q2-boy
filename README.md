@@ -54,11 +54,18 @@ remain, Pocket Boy can still read them from the flat folders.
 ## Get Games and manage ROMs
 
 On a Q2 connected to Wi-Fi, open the ROM library's **… → Get Games**.
-Browse itch.io by console (GB, GBC or GBA) and filter by free or paid. Pocket
-Boy checks the project before offering a free download, imports one compatible
-ROM from a raw file or ZIP, and saves the cover as a matching PNG beside it.
-**View on itch.io** shows a QR code for the creator's page, including paid
-games, optional donations, and projects without a compatible download.
+Use **Search** and the on-screen keyboard to find a title or creator across
+catalog pages. Open **Filters** to choose the console (GB, GBC or GBA), price,
+genre and sorting, then select **Apply**.
+
+Get Games lists projects with verifiable ROM uploads for the chosen console.
+A browser-only project or archive whose ROM contents cannot be verified is
+omitted. Pocket Boy imports one compatible ROM and saves a matching PNG for
+Cover Flow. **View on itch.io** opens the creator page via QR code for paid
+games and optional donations.
+
+**Installed** appears when an itch.io download with that project ID is on the
+SD card. Deleting the ROM clears the badge even if you keep its saves.
 
 To remove a file, touch and hold its cover or list row, then choose **Delete ROM**. Review the
 filename, optionally check **Also delete save data**, then continue to the

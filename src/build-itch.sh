@@ -6,7 +6,7 @@ case $out in /*) ;; *) out=$PWD/$out ;; esac
 src=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 cd "$src/itch-helper"
 GOOS=linux GOARCH=mipsle GOMIPS=softfloat CGO_ENABLED=0 "${GO_Q2:-go}" \
-    build -mod=vendor -trimpath -ldflags='-s -w' -o "$out" .
+    build -buildvcs=false -mod=vendor -trimpath -ldflags='-s -w' -o "$out" .
 # Go emits a soft-float ELF with the legacy NaN marker. The Q2 runs MIPS
 # NaN2008 user space. This binary has no hardware floating-point ABI.
 python3 - "$out" <<'PY'
