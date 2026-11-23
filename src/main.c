@@ -8,6 +8,7 @@
 #include <dirent.h>
 #include <errno.h>
 #include <math.h>
+#include <limits.h>
 #include <stdarg.h>
 #include <stddef.h>
 #include <stdbool.h>
@@ -27,7 +28,6 @@
 #define CART_HEIGHT 512
 #define SLOTS 10
 #define ROWS 5
-#define ROM_LIMIT 200
 #define DISPLAY_REQUEST "/tmp/q2-boy.display.req"
 #define DISPLAY_DIMMED "/tmp/q2-boy.display.dimmed"
 #define DISPLAY_IDLE_NS 30000000000ull
@@ -197,15 +197,13 @@ typedef struct {
 } Rom;
 typedef struct { int first, end, selected; } RomShelf;
 typedef char RomName[sizeof ((Rom *)0)->name];
-static Rom roms[ROM_LIMIT];
+static Rom *roms;
 static RomShelf shelves[SHELF_COUNT], *shelf = &shelves[RECENT], *previous_shelf;
-static RomName favorite_names[ROM_LIMIT];
-static int favorite_count, favorite_roms[ROM_LIMIT], recent_roms[RECENT_LIMIT];
+static RomName *favorite_names, *recent_names;
+static size_t favorite_capacity, recent_capacity;
+static int favorite_count, *favorite_roms, recent_roms[RECENT_LIMIT];
 static int rom_count, recent_count;
-static struct {
-    unsigned char version, sort, list;
-    char recent[ROM_LIMIT][256];
-} library;
+static struct { unsigned char version, sort, list; } library;
 static char library_file[PATH_CAP], favorites_file[PATH_CAP];
 static float flow_position, flow_start, flow_drag_origin;
 static uint64_t flow_started, flow_draw_at, title_since, system_slide_started;
@@ -1172,21 +1170,42 @@ static void set_fast(void) {
 static bool emulation_active(void) {
     return running && screen == GAME;
 }
+static void *reserve_library_array(void *array, size_t *allocated, size_t count, size_t item_size) {
+    if (count <= *allocated) return array;
+    size_t limit = SIZE_MAX / item_size;
+    if (limit > INT_MAX) limit = INT_MAX;
+    if (count > limit) return NULL;
+    size_t capacity = *allocated ? *allocated : 64;
+    while (capacity < count) capacity = capacity > limit / 2 ? limit : capacity * 2;
+    void *next = realloc(array, capacity * item_size);
+    if (next) *allocated = capacity;
+    return next;
+}
+
+static bool append_library_name(RomName **names, size_t *capacity, int *count, const RomName name) {
+    RomName *next = reserve_library_array(*names, capacity, (size_t)*count + 1, sizeof **names);
+    if (!next) return false;
+    *names = next;
+    memcpy(next[(*count)++], name, sizeof *next);
+    return true;
+}
+
 static void load_library(void) {
     FILE *file = fopen(library_file, "rb");
     if (!file) return;
-    size_t header_size = offsetof(__typeof__(library), recent);
-    if (fread(&library, 1, header_size, file) != header_size ||
+    if (fread(&library, 1, sizeof library, file) != sizeof library ||
         library.version != 1 || library.sort > SORT_COUNT || library.list > 1) {
         memset(&library, 0, sizeof library);
     } else {
         /* v0.2.5 stored a separate System sort. Shelves now always group by system. */
         if (library.sort == SORT_COUNT) library.sort = SORT_TITLE;
-        while (recent_count < ROM_LIMIT &&
-               fread(library.recent[recent_count], sizeof library.recent[0], 1, file) == 1) {
-            char *name = library.recent[recent_count];
-            if (!name[0] || !memchr(name, 0, sizeof library.recent[0])) break;
-            ++recent_count;
+        RomName name;
+        while (fread(name, sizeof name, 1, file) == 1 && name[0] && memchr(name, 0, sizeof name)) {
+            if (!append_library_name(&recent_names, &recent_capacity, &recent_count, name)) {
+                status("Not enough memory to load play history");
+                fclose(file);
+                return;
+            }
         }
     }
     fclose(file);
@@ -1194,26 +1213,69 @@ static void load_library(void) {
 
 static void store_library(void) {
     library.version = 1;
-    size_t length = offsetof(__typeof__(library), recent) + recent_count * sizeof library.recent[0];
-    if (!file_write(library_file, &library, length)) fprintf(stderr, "Could not save ROM library settings\n");
+    size_t names_size = (size_t)recent_count * sizeof *recent_names;
+    unsigned char *data = malloc(sizeof library + names_size);
+    if (data) {
+        memcpy(data, &library, sizeof library);
+        if (names_size) memcpy(data + sizeof library, recent_names, names_size);
+        if (!file_write(library_file, data, sizeof library + names_size))
+            fprintf(stderr, "Could not save ROM library settings\n");
+        free(data);
+    } else status("Not enough memory to save play history");
 }
+
+static int compare_names(const void *left, const void *right) { return strcmp(left, right); }
 
 static void load_favorites(void) {
     favorite_count = 0;
     FILE *file = fopen(favorites_file, "rb");
     if (!file) return;
     RomName name;
-    while (favorite_count < ROM_LIMIT && fread(name, sizeof name, 1, file) == 1) {
-        if (memchr(name, 0, sizeof name) && rom_system(name) != SYSTEM_COUNT)
-            memcpy(favorite_names[favorite_count++], name, sizeof name);
+    while (fread(name, sizeof name, 1, file) == 1) {
+        if (memchr(name, 0, sizeof name) && rom_system(name) != SYSTEM_COUNT &&
+            !append_library_name(&favorite_names, &favorite_capacity, &favorite_count, name)) {
+            status("Not enough memory to load Favorites");
+            break;
+        }
     }
     fclose(file);
+    if (favorite_count) qsort(favorite_names, favorite_count, sizeof *favorite_names, compare_names);
+}
+
+static int favorite_position(const char *name) {
+    int lo = 0, hi = favorite_count;
+    while (lo < hi) {
+        int mid = lo + (hi - lo) / 2;
+        if (strcmp(favorite_names[mid], name) < 0) lo = mid + 1;
+        else hi = mid;
+    }
+    return lo;
 }
 
 static int favorite_index(const char *name) {
-    for (int i = 0; i < favorite_count; ++i)
-        if (!strcmp(favorite_names[i], name)) return i;
-    return -1;
+    int i = favorite_position(name);
+    return i < favorite_count && !strcmp(favorite_names[i], name) ? i : -1;
+}
+
+static int compare_recent_indices(const void *left, const void *right) {
+    int a = *(const int *)left, b = *(const int *)right;
+    int order = strcmp(recent_names[a], recent_names[b]);
+    return order ? order : a - b;
+}
+
+static int recent_rank(const char *name, const int *lookup) {
+    if (!lookup) {
+        int rank = 0;
+        while (rank < recent_count && strcmp(name, recent_names[rank])) ++rank;
+        return rank;
+    }
+    int lo = 0, hi = recent_count;
+    while (lo < hi) {
+        int mid = lo + (hi - lo) / 2;
+        if (strcmp(recent_names[lookup[mid]], name) < 0) lo = mid + 1;
+        else hi = mid;
+    }
+    return lo < recent_count && !strcmp(name, recent_names[lookup[lo]]) ? lookup[lo] : recent_count;
 }
 
 static int rom_order(const Rom *a, const Rom *b) {
@@ -1257,12 +1319,14 @@ static void remember_highlights(RomName names[SHELF_COUNT]) {
 }
 
 static void sort_library(RomName names[SHELF_COUNT]) {
-    for (int i = 0; i < rom_count; ++i) {
-        int rank = 0;
-        while (rank < recent_count && strcmp(roms[i].name, library.recent[rank])) ++rank;
-        roms[i].recent_rank = rank;
+    int *lookup = recent_count ? malloc((size_t)recent_count * sizeof *lookup) : NULL;
+    if (lookup) {
+        for (int i = 0; i < recent_count; ++i) lookup[i] = i;
+        qsort(lookup, recent_count, sizeof *lookup, compare_recent_indices);
     }
-    qsort(roms, rom_count, sizeof roms[0], rom_compare);
+    for (int i = 0; i < rom_count; ++i) roms[i].recent_rank = recent_rank(roms[i].name, lookup);
+    free(lookup);
+    if (rom_count) qsort(roms, rom_count, sizeof *roms, rom_compare);
     int i = 0;
     for (int system = 0; system < SYSTEM_COUNT; ++system) {
         RomShelf *page = &shelves[system];
@@ -1277,19 +1341,23 @@ static void sort_library(RomName names[SHELF_COUNT]) {
     *favorites = (RomShelf){0};
     for (i = 0; i < rom_count; ++i)
         if (favorite_index(roms[i].name) >= 0) favorite_roms[favorites->end++] = i;
-    qsort(favorite_roms, favorites->end, sizeof favorite_roms[0], favorite_compare);
+    if (favorites->end) qsort(favorite_roms, favorites->end, sizeof *favorite_roms, favorite_compare);
     for (i = 0; i < favorites->end; ++i)
         if (!strcmp(shelf_rom(favorites, i)->name, names[FAVORITES])) favorites->selected = i;
     RomShelf *recent = &shelves[RECENT];
     *recent = (RomShelf){0};
-    for (int rank = 0; rank < recent_count && recent->end < RECENT_LIMIT; ++rank) {
-        for (i = 0; i < rom_count; ++i) {
-            if (roms[i].recent_rank != rank) continue;
-            if (!strcmp(roms[i].name, names[RECENT])) recent->selected = recent->end;
-            recent_roms[recent->end++] = i;
-            break;
-        }
+    for (i = 0; i < rom_count; ++i) {
+        int rank = roms[i].recent_rank;
+        if (rank >= recent_count) continue;
+        int pos = 0;
+        while (pos < recent->end && roms[recent_roms[pos]].recent_rank < rank) ++pos;
+        if (pos == RECENT_LIMIT || (pos < recent->end && roms[recent_roms[pos]].recent_rank == rank)) continue;
+        if (recent->end < RECENT_LIMIT) ++recent->end;
+        memmove(recent_roms + pos + 1, recent_roms + pos, (recent->end - pos - 1) * sizeof *recent_roms);
+        recent_roms[pos] = i;
     }
+    for (i = 0; i < recent->end; ++i)
+        if (!strcmp(shelf_rom(recent, i)->name, names[RECENT])) recent->selected = i;
     if (!shelf_available(shelf)) shelf = recent;
     flow_position = shelf->selected;
     flow_started = 0;
@@ -1309,9 +1377,15 @@ static void toggle_favorite(int row) {
         memmove(favorite_names + index, favorite_names + index + 1,
                 (favorite_count - index) * sizeof favorite_names[0]);
     } else {
-        if (favorite_count == ROM_LIMIT) { status("Favorites is full"); return; }
-        memset(favorite_names[favorite_count], 0, sizeof favorite_names[0]);
-        strcpy(favorite_names[favorite_count++], name);
+        RomName *next = reserve_library_array(favorite_names, &favorite_capacity,
+                                              (size_t)favorite_count + 1, sizeof *favorite_names);
+        if (!next) { status("Not enough memory to add Favorite"); return; }
+        favorite_names = next;
+        int pos = favorite_position(name);
+        memmove(favorite_names + pos + 1, favorite_names + pos, (favorite_count - pos) * sizeof *favorite_names);
+        memset(favorite_names[pos], 0, sizeof *favorite_names);
+        strcpy(favorite_names[pos], name);
+        ++favorite_count;
     }
     if (!file_write(favorites_file, favorite_names, favorite_count * sizeof favorite_names[0])) {
         load_favorites();
@@ -1329,26 +1403,23 @@ static const char *rom_directory(const Rom *rom) {
     return rom->legacy ? data_paths.roms : data_paths.system_roms[rom->system];
 }
 
-static bool name_already_indexed(const char *name) {
-    for (int i = 0; i < rom_count; ++i)
-        if (!strcasecmp(roms[i].name, name)) return true;
-    return false;
-}
-
-static void scan_rom_directory(const char *directory, enum CartridgeSystem expected) {
+static bool scan_rom_directory(const char *directory, enum CartridgeSystem expected,
+                               Rom **entries, size_t *capacity, int *count) {
     DIR *dir = opendir(directory);
-    if (!dir) return;
+    if (!dir) return true;
     struct dirent64 *entry;
-    while (rom_count < ROM_LIMIT && (entry = readdir64(dir))) {
+    while ((entry = readdir64(dir))) {
         const char *name = entry->d_name;
         enum CartridgeSystem system = rom_system(name);
         bool legacy = expected == SYSTEM_COUNT;
-        if (name[0] == '.' || system == SYSTEM_COUNT || (!legacy && system != expected) ||
-            (legacy && name_already_indexed(name))) continue;
+        if (name[0] == '.' || system == SYSTEM_COUNT || (!legacy && system != expected)) continue;
         char path[PATH_CAP];
         struct stat64 st;
         if (!join_path(path, directory, name) || stat64(path, &st) || !S_ISREG(st.st_mode)) continue;
-        Rom *rom = &roms[rom_count++];
+        Rom *next = reserve_library_array(*entries, capacity, (size_t)*count + 1, sizeof *next);
+        if (!next) { closedir(dir); return false; }
+        *entries = next;
+        Rom *rom = &next[(*count)++];
         strcpy(rom->name, name);
         rom->title_length = (int)(strrchr(rom->name, '.') - rom->name);
         rom->itch_id = 0;
@@ -1364,16 +1435,46 @@ static void scan_rom_directory(const char *directory, enum CartridgeSystem expec
         rom->legacy = legacy;
     }
     closedir(dir);
+    return true;
+}
+
+static int compare_entry_names(const void *left, const void *right) {
+    const Rom *a = left, *b = right;
+    int order = strcasecmp(a->name, b->name);
+    if (order) return order;
+    if (a->legacy != b->legacy) return a->legacy - b->legacy;
+    return strcmp(a->name, b->name);
 }
 
 static void scan_roms(void) {
+    Rom *entries = NULL;
+    size_t capacity = 0;
+    int count = 0;
+    bool complete = true;
+    for (int system = 0; complete && system < SYSTEM_COUNT; ++system)
+        complete = scan_rom_directory(data_paths.system_roms[system], system, &entries, &capacity, &count);
+    if (complete) complete = scan_rom_directory(data_paths.roms, SYSTEM_COUNT, &entries, &capacity, &count);
+    int *favorites = count ? malloc((size_t)count * sizeof *favorites) : NULL;
+    if (!complete || (count && !favorites)) {
+        free(entries);
+        free(favorites);
+        status("Not enough memory to refresh ROM library");
+        return;
+    }
+    if (count) qsort(entries, count, sizeof *entries, compare_entry_names);
+    int unique = 0;
+    for (int i = 0; i < count; ++i) {
+        if (entries[i].legacy && unique && !strcasecmp(entries[i].name, entries[unique - 1].name)) continue;
+        entries[unique++] = entries[i];
+    }
     RomName selected[SHELF_COUNT];
     remember_highlights(selected);
-    rom_count = 0;
+    free(roms);
+    free(favorite_roms);
+    roms = entries;
+    favorite_roms = favorites;
+    rom_count = unique;
     cover_clear();
-    for (int system = 0; system < SYSTEM_COUNT; ++system)
-        scan_rom_directory(data_paths.system_roms[system], system);
-    scan_rom_directory(data_paths.roms, SYSTEM_COUNT);
     sort_library(selected);
 }
 
@@ -1517,11 +1618,15 @@ static void remember_launch(void) {
     remember_highlights(selected);
     int rank = shelf_rom(shelf, shelf->selected)->recent_rank;
     if (!rank && recent_count) return;
-    int move = clamp(rank, 0, ROM_LIMIT - 1);
-    memmove(library.recent + 1, library.recent, move * sizeof library.recent[0]);
-    memset(library.recent[0], 0, sizeof library.recent[0]);
-    strcpy(library.recent[0], selected[shelf - shelves]);
-    if (rank == recent_count && recent_count < ROM_LIMIT) ++recent_count;
+    if (rank == recent_count) {
+        if (!append_library_name(&recent_names, &recent_capacity, &recent_count, selected[shelf - shelves])) {
+            status("Not enough memory to record play history");
+            return;
+        }
+    }
+    memmove(recent_names + 1, recent_names, (size_t)rank * sizeof *recent_names);
+    memset(recent_names[0], 0, sizeof *recent_names);
+    strcpy(recent_names[0], selected[shelf - shelves]);
     sort_library(selected);
     store_library();
 }
@@ -2408,10 +2513,8 @@ static void activate_menu(int index) {
         break;
     }
     case ITCH_GAME:
-        if (index == 0) {
-            if (rom_count >= ROM_LIMIT) status("ROM library is full");
-            else (void)start_itch(ITCH_DOWNLOAD);
-        } else if (index == 1) (void)start_itch(ITCH_LINK);
+        if (index == 0) (void)start_itch(ITCH_DOWNLOAD);
+        else if (index == 1) (void)start_itch(ITCH_LINK);
         else go_back();
         break;
     case ITCH_QR: go_back(); break;
@@ -3286,7 +3389,9 @@ static int smoke_test(const char *path) {
     go_back();
     RomShelf *saved_shelf = shelf;
     RomShelf saved_console = shelves[SYSTEM_GBA];
-    Rom saved_rom = roms[0];
+    Rom *saved_roms = roms;
+    Rom fixture;
+    roms = &fixture;
     bool saved_list = library.list;
     shelf = &shelves[SYSTEM_GBA];
     *shelf = (RomShelf){.end = 1};
@@ -3318,7 +3423,7 @@ static int smoke_test(const char *path) {
         go_back();
     }
     library.list = saved_list;
-    roms[0] = saved_rom;
+    roms = saved_roms;
     *shelf = saved_console;
     shelf = saved_shelf;
     set_screen(BROWSER);
@@ -3445,7 +3550,7 @@ static void log_launch(void) {
     sigaction(SIGSEGV, &action, NULL);
     sigaction(SIGABRT, &action, NULL);
     sigaction(SIGFPE, &action, NULL);
-    fprintf(stderr, "\nq2-boy 0.4.1, engine=%s\n",
+    fprintf(stderr, "\nq2-boy 0.4.2, engine=%s\n",
             use_dynarec ? "dynamic recompiler (opt-in)" : "interpreter");
     FILE *memory = fopen("/proc/meminfo", "r");
     if (memory) {
