@@ -202,3 +202,48 @@ void library_migrate(const LibraryPaths *paths) {
     }
     close(lock);
 }
+
+static bool unlink_optional(const char *directory, const char *name) {
+    char path[PATH_CAP];
+    if (!join_path(path, directory, name)) return false;
+    return !unlink(path) || errno == ENOENT;
+}
+
+enum RomRemoval library_remove_rom(const LibraryPaths *paths, const char *name, bool legacy,
+                                   bool remove_saves, unsigned slots) {
+    enum CartridgeSystem system = rom_system(name);
+    if (system == SYSTEM_COUNT || name[0] == '.' || strchr(name, '/')) return ROM_REMOVE_FAILED;
+    const char *directory = legacy ? paths->roms : paths->system_roms[system];
+    char path[PATH_CAP];
+    struct stat64 st;
+    if (!join_path(path, directory, name) || lstat64(path, &st) ||
+        (!S_ISREG(st.st_mode) && !S_ISLNK(st.st_mode)) || unlink(path)) return ROM_REMOVE_FAILED;
+
+    bool clean = true;
+    size_t stem_length = strrchr(name, '.') - name;
+    const char *const covers[] = {".png", ".jpg", ".jpeg"};
+    char filename[300];
+    if (stem_length < 256 && !matching_rom(directory, name, stem_length, SYSTEM_COUNT)) {
+        for (unsigned i = 0; i < sizeof covers / sizeof covers[0]; ++i) {
+            snprintf(filename, sizeof filename, "%.*s%s", (int)stem_length, name, covers[i]);
+            if (!unlink_optional(directory, filename)) clean = false;
+        }
+    }
+    if (remove_saves) {
+        /* A flat-layout duplicate can appear once the per-console copy is gone. */
+        const char *other = legacy ? paths->system_roms[system] : paths->roms;
+        if (!join_path(path, other, name) || !path_absent(path)) return ROM_REMOVE_INCOMPLETE;
+        const char *const suffixes[] = {".srm", ".rtc", ".latest-state"};
+        for (unsigned i = 0; i < sizeof suffixes / sizeof suffixes[0]; ++i) {
+            snprintf(filename, sizeof filename, "%s%s", name, suffixes[i]);
+            if (!unlink_optional(paths->system_saves[system], filename)) clean = false;
+            if (!unlink_optional(paths->saves, filename)) clean = false;
+        }
+        for (unsigned slot = 1; slot <= slots; ++slot) {
+            snprintf(filename, sizeof filename, "%s.state%02u", name, slot);
+            if (!unlink_optional(paths->system_saves[system], filename)) clean = false;
+            if (!unlink_optional(paths->saves, filename)) clean = false;
+        }
+    }
+    return clean ? ROM_REMOVED : ROM_REMOVE_INCOMPLETE;
+}

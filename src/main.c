@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 #include "platform.h"
 #include "library_paths.h"
+#include "itch.h"
 #include "libretro.h"
 #include <dlfcn.h>
 #include "font.h"
@@ -39,7 +40,8 @@
 
 enum Screen {
     BROWSER, GAME, MENU, STATES, SETTINGS, EDIT, CONFIRM, AUDIO, PHYSICAL, TOUCH, ASSIGN,
-    BROWSER_OPTIONS, APP_MENU, COPY_TARGET, COPY_SOURCE
+    BROWSER_OPTIONS, APP_MENU, COPY_TARGET, COPY_SOURCE, GET_GAMES, ITCH_GAME, ITCH_QR,
+    ROM_ACTIONS, DELETE_ROM, CONFIRM_DELETE
 };
 enum Scale { FIT, CROP, STRETCH, INTEGER_SCALE, SCALE_COUNT };
 enum VideoFilter { NEAREST, SHARP_BILINEAR };
@@ -210,13 +212,32 @@ static uint64_t prefetch_selection, prefetch_at;
 static int prefetched, last_marquee_offset;
 static bool touching_flow;
 static bool browser_actions_open;
+static Rom delete_rom;
+static bool delete_saves;
+enum ItchAction { ITCH_LIST, ITCH_INFO, ITCH_DOWNLOAD, ITCH_LINK };
+static ItchJob itch_job;
+static enum ItchAction itch_action;
+static ItchGame itch_games[ITCH_LIMIT];
+static int itch_system = SYSTEM_GBA, itch_filter, itch_feed = 1, itch_offset, itch_count, itch_selected;
+static const char *const itch_systems[] = {"gb", "gbc", "gba"};
+static const char *const itch_filters[] = {"all", "free", "paid"};
+static const char *const itch_filter_labels[] = {"All", "Free", "Paid"};
+static char itch_game_price[27], itch_suggested[22], itch_message[95];
+static unsigned char itch_qr_grid[ITCH_QR_LIMIT][ITCH_QR_LIMIT];
+static int itch_qr_size;
+static bool itch_free, itch_list_failed, itch_skip_to_end;
+static uint64_t itch_poll_at, itch_started;
 static enum { TOUCH_TAP, TOUCH_HORIZONTAL, TOUCH_VERTICAL } flow_gesture;
 static int flow_down_x, flow_down_y, system_slide_direction, system_slide_offset;
 
 #define BROWSER_BUTTON_Y 12
 #define BROWSER_HEADER_BOTTOM 54
-#define EXIT_X 36
-#define EXIT_W 84
+#define GET_GAMES_X 20
+#define GET_GAMES_W 100
+#define ROM_HOLD_NS 550000000ull
+#define ROM_HOLD_SLOP 8
+static uint64_t browser_hold_at;
+static int browser_hold_rom;
 #define APP_MENU_X 126
 #define APP_MENU_W 103
 #define HEART_TARGET 32
@@ -1086,6 +1107,7 @@ static void set_screen(enum Screen next) {
     screen = next;
     game_edge.direction = 0;
     touching_flow = false;
+    browser_hold_at = 0;
     browser_actions_open = false;
     flow_position = shelf->selected;
     flow_started = 0;
@@ -1313,6 +1335,12 @@ static void scan_rom_directory(const char *directory, enum CartridgeSystem expec
         Rom *rom = &roms[rom_count++];
         strcpy(rom->name, name);
         rom->title_length = (int)(strrchr(rom->name, '.') - rom->name);
+        const char *itch_id = strrchr(rom->name, '[');
+        if (itch_id && itch_id > rom->name + 1 && itch_id[-1] == ' ' && !strncmp(itch_id, "[itch ", 6)) {
+            size_t digits = strspn(itch_id + 6, "0123456789");
+            if (digits && itch_id + 6 + digits == rom->name + rom->title_length - 1 && itch_id[6 + digits] == ']')
+                rom->title_length = (int)(itch_id - rom->name - 1);
+        }
         rom->system = system;
         rom->legacy = legacy;
     }
@@ -1328,6 +1356,112 @@ static void scan_roms(void) {
         scan_rom_directory(data_paths.system_roms[system], system);
     scan_rom_directory(data_paths.roms, SYSTEM_COUNT);
     sort_library(selected);
+}
+
+static bool may_delete(const Rom *rom) {
+    char path[PATH_CAP];
+    return join_path(path, rom_directory(rom), rom->name) && (!running || strcmp(path, active_rom));
+}
+
+static void delete_selected(void) {
+    if (!may_delete(&delete_rom)) { status("Close this game before deleting it"); return; }
+    enum RomRemoval result = library_remove_rom(&data_paths, delete_rom.name, delete_rom.legacy,
+                                                delete_saves, SLOTS);
+    if (result == ROM_REMOVE_FAILED) { status("Could not delete the ROM"); return; }
+    /* Reload the library from disk. Retained save data is still found by filename. */
+    cover_cache_clear();
+    scan_roms();
+    set_screen(BROWSER);
+    status(result == ROM_REMOVE_INCOMPLETE ? "ROM deleted. Some related files were kept"
+                                          : delete_saves ? "ROM and save data deleted" : "ROM deleted. Saves kept");
+}
+
+static bool start_itch(enum ItchAction action) {
+    if (smoke) return false;
+    char helper[PATH_CAP];
+    if (!join_path(helper, app_dir, "q2-boy-itch")) return false;
+    char number[8];
+    snprintf(number, sizeof number, "%d", itch_feed);
+    const char *const commands[] = {"list", "info", "download", "qr"};
+    char *arguments[] = {helper, (char *)commands[action], NULL, NULL, NULL, NULL};
+    if (action == ITCH_LIST) {
+        arguments[2] = (char *)itch_systems[itch_system];
+        arguments[3] = (char *)itch_filters[itch_filter];
+        arguments[4] = number;
+    } else {
+        arguments[2] = itch_games[itch_selected].url;
+        if (action == ITCH_DOWNLOAD) {
+            arguments[3] = data_paths.roms;
+            arguments[4] = (char *)itch_systems[itch_system];
+        }
+    }
+    if (!itch_start(&itch_job, helper, arguments)) {
+        snprintf(itch_message, sizeof itch_message, "Could not start the itch.io helper");
+        dirty = 1;
+        return false;
+    }
+    itch_action = action;
+    itch_started = clock_ns();
+    itch_poll_at = 0;
+    itch_message[0] = 0;
+    return true;
+}
+
+static void load_itch_page(int feed, bool end) {
+    itch_feed = clamp(feed, 1, 100);
+    itch_count = itch_offset = 0;
+    itch_skip_to_end = end;
+    itch_list_failed = !start_itch(ITCH_LIST);
+    menu_focus = 0;
+}
+
+static uint64_t update_itch(uint64_t now) {
+    if (!itch_job.pid) return UINT64_MAX;
+    if (now < itch_poll_at) return itch_poll_at;
+    bool ok;
+    if (now - itch_started > 90ull * 1000000000ull) {
+        itch_stop(&itch_job);
+        snprintf(itch_job.result, sizeof itch_job.result, "itch.io timed out. Try again");
+        ok = false;
+    } else if (!itch_finished(&itch_job, &ok)) {
+        return itch_poll_at = now + 50000000ull;
+    }
+    char *result = itch_job.result;
+    if (!ok || itch_action == ITCH_DOWNLOAD) {
+        snprintf(itch_message, sizeof itch_message, "%.94s", *result ? result : "Could not run the itch.io helper");
+        itch_message[strcspn(itch_message, "\r\n")] = 0;
+    }
+    switch (itch_action) {
+    case ITCH_LIST:
+        itch_list_failed = !ok;
+        if (ok) {
+            itch_count = itch_catalog(result, itch_games);
+            if (itch_skip_to_end && itch_count) itch_offset = (itch_count - 1) / ROWS * ROWS;
+            if (itch_count) menu_focus = 2;
+            else snprintf(itch_message, sizeof itch_message, "No projects on this page");
+        }
+        break;
+    case ITCH_INFO:
+        if (ok) {
+            char *suggested = strchr(result, '\t');
+            if (suggested) {
+                *suggested++ = 0;
+                suggested[strcspn(suggested, "\r\n")] = 0;
+                snprintf(itch_suggested, sizeof itch_suggested, "%.21s", suggested);
+                snprintf(itch_game_price, sizeof itch_game_price, "%.26s", result);
+                itch_free = !strcmp(result, "Free") || !strcmp(result, "Free / name your price");
+            }
+        }
+        break;
+    case ITCH_DOWNLOAD:
+        if (ok) scan_roms();
+        break;
+    case ITCH_LINK:
+        if (ok && (itch_qr_size = itch_qr(result, itch_qr_grid))) set_screen(ITCH_QR);
+        break;
+    }
+    dirty = 1;
+    return UINT64_MAX;
 }
 
 static void remember_launch(void) {
@@ -1513,8 +1647,45 @@ static int menu_items(MenuItem *items) {
         ITEM(15, 95, 345, 40, label, true);
         ITEM(15, 138, 345, 40, filter_label(), true);
         ITEM(15, 181, 345, 40, "Copy control layout", true);
-        ITEM(15, 224, 345, 40, quit_off ? "Force close: Off" : "Force close: Hold Return + Centre", firmware_keys);
+        ITEM(15, 223, 345, 34, quit_off ? "Force close: Off" : "Force close: Hold Return + Centre", firmware_keys);
+        ITEM(15, 261, 113, 45, "Resume", running);
+        ITEM(131, 261, 151, 45, "Exit", true);
+        ITEM(285, 261, 75, 45, "Back", true);
+        break;
+    case GET_GAMES:
+        snprintf(label, sizeof label, "Console: %s", system_short[itch_system]);
+        ITEM(15, 55, 171, 32, label, !itch_job.pid);
+        snprintf(label, sizeof label, "Show: %s", itch_filter_labels[itch_filter]);
+        ITEM(190, 55, 170, 32, label, !itch_job.pid);
+        for (int row = 0; row < ROWS; ++row) {
+            int i = itch_offset + row;
+            ITEM(15, 91 + row * 34, 345, 31, i < itch_count ? itch_games[i].title : "", i < itch_count && !itch_job.pid);
+        }
+        ITEM(15, 267, 109, 40, "Previous", !itch_job.pid && (itch_offset > 0 || itch_feed > 1));
+        ITEM(128, 267, 113, 40, itch_list_failed ? "Retry" : "Next",
+             !itch_job.pid && (itch_list_failed || (itch_count && (itch_offset + ROWS < itch_count || itch_feed < 100))));
+        ITEM(245, 267, 115, 40, "Back", true);
+        break;
+    case ITCH_GAME:
+        ITEM(15, 137, 345, 39, "Download ROM", itch_free && !itch_job.pid);
+        ITEM(15, 183, 345, 39, itch_free && *itch_suggested ? "View / support on itch.io" : "View on itch.io", !itch_job.pid);
         ITEM(15, 267, 345, 40, "Back", true);
+        break;
+    case ITCH_QR:
+        ITEM(15, 267, 345, 40, "Back", true);
+        break;
+    case ROM_ACTIONS:
+        ITEM(48, 141, 279, 42, "Delete ROM", true);
+        ITEM(48, 190, 279, 38, "Cancel", true);
+        break;
+    case DELETE_ROM:
+        ITEM(15, 114, 345, 42, delete_saves ? "[x] Also delete save data" : "[ ] Also delete save data", true);
+        ITEM(15, 171, 345, 42, "Cancel", true);
+        ITEM(15, 234, 345, 42, "Continue to confirmation", true);
+        break;
+    case CONFIRM_DELETE:
+        ITEM(15, 115, 345, 42, "Cancel", true);
+        ITEM(15, 177, 345, 42, delete_saves ? "Delete ROM and save data" : "Delete ROM only", true);
         break;
     case COPY_TARGET: case COPY_SOURCE:
         for (int system = 0; system < SYSTEM_COUNT; ++system) {
@@ -1772,7 +1943,7 @@ static void draw_browser(void) {
     char sort[26];
     snprintf(sort, sizeof sort, "Sort: %s", sort_short[library.sort]);
     browser_button(SORT_X, BROWSER_BUTTON_Y, SORT_W, sort, true);
-    browser_button(EXIT_X, BROWSER_BUTTON_Y, EXIT_W, running ? "Resume" : "Exit", true);
+    browser_button(GET_GAMES_X, BROWSER_BUTTON_Y, GET_GAMES_W, "Get Games", true);
     browser_button(APP_MENU_X, BROWSER_BUTTON_Y, APP_MENU_W, "Menu", true);
 }
 
@@ -1850,7 +2021,46 @@ static void draw_ui(void) {
     case GAME: draw_game(); break;
     case BROWSER: draw_browser(); break;
     case APP_MENU:
-        header("Pocket Boy", "Settings for all consoles");
+        header("Pocket Boy", "Library settings and games");
+        break;
+    case GET_GAMES:
+        snprintf(sub, sizeof sub, "itch.io  |  Page %d.%d", itch_feed, itch_offset / ROWS + 1);
+        header("Get Games", sub);
+        if (itch_job.pid || *itch_message)
+            text_at(19, 245, itch_job.pid ? "Loading itch.io catalog..." : itch_message, ACCENT, WIDTH - 15);
+        break;
+    case ITCH_GAME: {
+        const ItchGame *game = &itch_games[itch_selected];
+        header(game->title, game->creator);
+        snprintf(sub, sizeof sub, "%s%s%s", itch_game_price, *itch_suggested ? "  |  Suggested " : "", itch_suggested);
+        text_at(17, 63, sub, WHITE, WIDTH - 15);
+        if (!itch_free && !itch_job.pid && !*itch_message)
+            text_at(17, 94, "Open itch.io on your phone", GRAY, WIDTH - 15);
+        if (itch_job.pid || *itch_message) {
+            const char *message = itch_action == ITCH_DOWNLOAD ? "Downloading ROM and cover..." : "Checking itch.io...";
+            text_at(17, 232, itch_job.pid ? message : itch_message, ACCENT, WIDTH - 15);
+        }
+        break;
+    }
+    case ITCH_QR: {
+        header("View on itch.io", "Scan with your phone");
+        int cell = 200 / itch_qr_size, side = cell * itch_qr_size;
+        int left = (WIDTH - side) / 2, top = 49 + (200 - side) / 2;
+        rect(left, top, side, side, RGB(0xffffff));
+        for (int y = 0; y < itch_qr_size; ++y)
+            for (int x = 0; x < itch_qr_size; ++x)
+                if (itch_qr_grid[y][x]) rect(left + x * cell, top + y * cell, cell, cell, RGB(0x000000));
+        break;
+    }
+    case ROM_ACTIONS:
+        draw_browser();
+        rect(35, 83, 305, 158, DARK);
+        rect(35, 83, 305, 2, ACCENT);
+        text_at(48, 101, delete_rom.name, WHITE, 326);
+        break;
+    case DELETE_ROM: case CONFIRM_DELETE:
+        header(screen == DELETE_ROM ? "Delete ROM?" : "Confirm deletion", delete_rom.name);
+        text_at(17, 69, delete_saves ? "This also removes save RAM, RTC and states." : "Save data will be kept.", GRAY, WIDTH - 15);
         break;
     case COPY_TARGET:
         header("Copy control layout", "Choose the console to update.");
@@ -1910,11 +2120,12 @@ static void draw_ui(void) {
                                              : "Unsaved progress in this session will be lost.");
         break;
     }
-    MenuItem items[9];
+    MenuItem items[10];
     int count = menu_items(items);
     for (int i = 0; i < count; ++i) {
         const MenuItem *m = &items[i];
         bool focused = m->enabled && i == menu_focus;
+        if (!*m->label) continue;
         uint32_t fill = focused ? RGB(0x245448) : RGB(0x16282b);
         rect(m->x, m->y, m->w, m->h, fill);
         if (focused) rect(m->x, m->y, 4, m->h, ACCENT);
@@ -1957,7 +2168,24 @@ static bool within(int x, int y, int left, int top, int width) {
 }
 static void go_back(void) {
     switch (screen) {
-    case BROWSER_OPTIONS: case APP_MENU: set_screen(BROWSER); break;
+    case BROWSER_OPTIONS: case APP_MENU: case ROM_ACTIONS: case DELETE_ROM:
+        set_screen(BROWSER); break;
+    case CONFIRM_DELETE: set_screen(DELETE_ROM); menu_focus = 1; break;
+    case GET_GAMES:
+        itch_stop(&itch_job);
+        set_screen(BROWSER);
+        break;
+    case ITCH_GAME:
+        if (itch_job.pid && itch_action == ITCH_DOWNLOAD) {
+            status("Wait for the current download to finish");
+            break;
+        }
+        itch_stop(&itch_job);
+        itch_message[0] = 0;
+        set_screen(GET_GAMES);
+        menu_focus = 2 + itch_selected - itch_offset;
+        break;
+    case ITCH_QR: set_screen(ITCH_GAME); menu_focus = 1; break;
     case COPY_TARGET: set_screen(APP_MENU); break;
     case COPY_SOURCE: set_screen(COPY_TARGET); break;
     case BROWSER:
@@ -2009,7 +2237,7 @@ static void pick_system(int direction) {
 }
 
 static void activate_menu(int index) {
-    MenuItem items[9];
+    MenuItem items[10];
     int count = menu_items(items);
     if (index < 0 || index >= count || !items[index].enabled) return;
     menu_focus = index;
@@ -2024,8 +2252,57 @@ static void activate_menu(int index) {
         else if (index == 4) {
             if (write_quit_option(!quit_off)) { quit_off = !quit_off; store_config(); }
             else status("Could not set force-close shortcut");
-        }
+        } else if (index == 5) set_screen(GAME);
+        else if (index == 6) quitting = 1;
         else go_back();
+        break;
+    case GET_GAMES:
+        if (index == 0 || index == 1) {
+            if (!index) itch_system = (itch_system + 1) % 3;
+            else itch_filter = (itch_filter + 1) % 3;
+            load_itch_page(1, false);
+        } else if (index < 2 + ROWS) {
+            itch_selected = itch_offset + index - 2;
+            itch_free = false;
+            itch_suggested[0] = 0;
+            snprintf(itch_game_price, sizeof itch_game_price, "%s", itch_games[itch_selected].price);
+            set_screen(ITCH_GAME);
+            menu_focus = 2;
+            (void)start_itch(ITCH_INFO);
+        } else if (index == 2 + ROWS) {
+            if (itch_offset > 0) { itch_offset -= ROWS; menu_focus = 2; }
+            else load_itch_page(itch_feed - 1, true);
+        } else if (index == 3 + ROWS) {
+            if (itch_list_failed) load_itch_page(itch_feed, false);
+            else if (itch_offset + ROWS < itch_count) { itch_offset += ROWS; menu_focus = 2; }
+            else load_itch_page(itch_feed + 1, false);
+        } else go_back();
+        break;
+    case ITCH_GAME:
+        if (index == 0) {
+            if (rom_count >= ROM_LIMIT) status("ROM library is full");
+            else (void)start_itch(ITCH_DOWNLOAD);
+        } else if (index == 1) (void)start_itch(ITCH_LINK);
+        else go_back();
+        break;
+    case ITCH_QR: go_back(); break;
+    case ROM_ACTIONS:
+        if (index == 1) go_back();
+        else if (!may_delete(&delete_rom)) status("Close this game before deleting it");
+        else {
+            delete_saves = false;
+            set_screen(DELETE_ROM);
+            menu_focus = 1;
+        }
+        break;
+    case DELETE_ROM:
+        if (index == 0) delete_saves = !delete_saves;
+        else if (index == 1) go_back();
+        else set_screen(CONFIRM_DELETE);
+        break;
+    case CONFIRM_DELETE:
+        if (index == 0) { set_screen(DELETE_ROM); menu_focus = 1; }
+        else delete_selected();
         break;
     case COPY_TARGET:
         if (index == SYSTEM_COUNT) go_back();
@@ -2147,7 +2424,7 @@ static void activate_menu(int index) {
     dirty = 1;
 }
 static void tap_menu(int x, int y) {
-    MenuItem items[9];
+    MenuItem items[10];
     int count = menu_items(items);
     for (int i = 0; i < count; ++i) {
         const MenuItem *m = &items[i];
@@ -2158,20 +2435,14 @@ static void tap_menu(int x, int y) {
     }
 }
 static void step_menu(int step) {
-    MenuItem items[9];
+    MenuItem items[10];
     int count = menu_items(items);
     if (!count) return;
     do { menu_focus = (menu_focus + step + count) % count; } while (!items[menu_focus].enabled);
     dirty = 1;
 }
-static void tap_cover(int x, int y) {
+static int cover_at(int x, int y) {
     int mid = (int)(flow_position + 0.5f);
-    int heart_x, heart_y;
-    if (heart_position(shelf_rom(shelf, mid), mid - flow_position, &heart_x, &heart_y) &&
-        heart_hit(x, y, heart_x, heart_y)) {
-        toggle_favorite(mid);
-        return;
-    }
     int closest = -1;
     float best = COVER_REACH;
     for (int i = clamp(mid - 4, shelf->first, shelf->end - 1);
@@ -2185,10 +2456,46 @@ static void tap_cover(int x, int y) {
             best = distance;
         }
     }
+    return closest;
+}
+
+static bool cover_heart_at(int x, int y) {
+    int mid = (int)(flow_position + 0.5f), heart_x, heart_y;
+    return heart_position(shelf_rom(shelf, mid), mid - flow_position, &heart_x, &heart_y) &&
+           heart_hit(x, y, heart_x, heart_y);
+}
+
+static void tap_cover(int x, int y) {
+    int mid = (int)(flow_position + 0.5f);
+    if (cover_heart_at(x, y)) {
+        toggle_favorite(mid);
+        return;
+    }
+    int closest = cover_at(x, y);
     if (closest == mid) {
         shelf->selected = mid;
         launch_selected();
     } else if (closest >= 0) pick_rom(closest - shelf->selected);
+}
+
+static int list_rom_at(int x, int y) {
+    if (x < 28 || x >= WIDTH - 28 || y < LIST_TOP) return -1;
+    int row = (y - LIST_TOP) / LIST_ROW, index = list_first() + row;
+    if (row >= ROWS || (y - LIST_TOP) % LIST_ROW >= 39 || index >= shelf->end) return -1;
+    return index;
+}
+
+static bool list_heart_at(int x, int y) {
+    int row = (y - LIST_TOP) / LIST_ROW;
+    return heart_hit(x, y, LIST_HEART_X, LIST_TOP + row * LIST_ROW + 3);
+}
+
+static uint64_t update_browser_hold(uint64_t now) {
+    if (screen != BROWSER || !touching_flow || !browser_hold_at) return UINT64_MAX;
+    if (now < browser_hold_at) return browser_hold_at;
+    delete_rom = *shelf_rom(shelf, browser_hold_rom);
+    set_screen(ROM_ACTIONS);
+    return UINT64_MAX;
 }
 
 static void browser_touch(char action, int x, int y) {
@@ -2198,10 +2505,28 @@ static void browser_touch(char action, int x, int y) {
         flow_down_y = y;
         flow_drag_origin = flow_position;
         flow_gesture = TOUCH_TAP;
+        browser_hold_at = 0;
+        if (y >= BROWSER_HEADER_BOTTOM && !browser_actions_open && !previous_shelf && shelf_has_games(shelf)) {
+            int index = -1;
+            if (browser_list()) {
+                if (!list_heart_at(x, y)) index = list_rom_at(x, y);
+            } else if (!cover_heart_at(x, y)) index = cover_at(x, y);
+            if (index >= 0) {
+                browser_hold_rom = index;
+                browser_hold_at = clock_ns() + ROM_HOLD_NS;
+            }
+        }
         return;
     }
     if (!touching_flow) return;
     int dx = x - flow_down_x, dy = y - flow_down_y;
+    bool moved = abs(dx) >= ROM_HOLD_SLOP || abs(dy) >= ROM_HOLD_SLOP;
+    if (moved) browser_hold_at = 0;
+    if (action == 'u') {
+        update_browser_hold(clock_ns());
+        if (screen != BROWSER) return;
+        browser_hold_at = 0;
+    }
     if (flow_gesture == TOUCH_TAP && flow_down_y >= BROWSER_HEADER_BOTTOM &&
         (abs(dx) >= 8 || abs(dy) >= 8)) {
         if (abs(dy) > abs(dx)) flow_gesture = TOUCH_VERTICAL;
@@ -2239,18 +2564,20 @@ static void browser_touch(char action, int x, int y) {
         if (within(x, y, SORT_X, BROWSER_BUTTON_Y, SORT_W)) {
             set_screen(BROWSER_OPTIONS);
             menu_focus = library.sort;
-        } else if (within(x, y, EXIT_X, BROWSER_BUTTON_Y, EXIT_W)) go_back();
-        else if (within(x, y, APP_MENU_X, BROWSER_BUTTON_Y, APP_MENU_W)) set_screen(APP_MENU);
+        } else if (within(x, y, GET_GAMES_X, BROWSER_BUTTON_Y, GET_GAMES_W)) {
+            int current = (int)(shelf - shelves);
+            if (current <= SYSTEM_GBA) itch_system = current;
+            set_screen(GET_GAMES);
+            load_itch_page(1, false);
+        } else if (within(x, y, APP_MENU_X, BROWSER_BUTTON_Y, APP_MENU_W)) set_screen(APP_MENU);
         return;
     }
     if (!shelf_has_games(shelf) || previous_shelf) return;
     if (!browser_list() && y >= BROWSER_HEADER_BOTTOM) tap_cover(x, y);
     else if (browser_list()) {
-        int row = (y - LIST_TOP) / LIST_ROW;
-        int index = list_first() + row;
-        if (x >= 28 && x < WIDTH - 28 && y >= LIST_TOP && row < ROWS &&
-            (y - LIST_TOP) % LIST_ROW < 39 && index < shelf->end) {
-            if (heart_hit(x, y, LIST_HEART_X, LIST_TOP + row * LIST_ROW + 3)) toggle_favorite(index);
+        int index = list_rom_at(x, y);
+        if (index >= 0) {
+            if (list_heart_at(x, y)) toggle_favorite(index);
             else { shelf->selected = index; launch_selected(); }
         } else if (within(x, y, 37, FLOW_FOOT_Y, 89)) pick_rom(-ROWS);
         else if (within(x, y, 133, FLOW_FOOT_Y, 89)) pick_rom(ROWS);
@@ -2329,6 +2656,7 @@ static void read_touch(char action, int x, int y) {
     case GAME: case BROWSER: break; /* Handled above to distinguish taps from swipes. */
     case MENU: case STATES: case SETTINGS: case CONFIRM: case AUDIO: case PHYSICAL: case TOUCH:
     case ASSIGN: case BROWSER_OPTIONS: case APP_MENU: case COPY_TARGET: case COPY_SOURCE:
+    case GET_GAMES: case ITCH_GAME: case ITCH_QR: case ROM_ACTIONS: case DELETE_ROM: case CONFIRM_DELETE:
         tap_menu(x, y);
         break;
     case EDIT: {
@@ -2355,6 +2683,8 @@ static void dismiss_browser_actions(void) {
 
 static void read_wheel(int delta) {
     if (!delta || screen == GAME) return;
+    if (browser_hold_at) touching_flow = false;
+    browser_hold_at = 0;
     dismiss_browser_actions();
     uint64_t now = clock_ns();
     if (!wheel_time || now - wheel_time > 300000000ull) wheel_delta = 0;
@@ -2427,6 +2757,8 @@ static void read_event(Event e) {
     if (e.kind == 'w') { read_wheel(e.x); return; }
     if (e.kind == 't') { read_touch(e.action, e.x, e.y); return; }
     if (e.kind == 'r') {
+        if (browser_hold_at) touching_flow = false;
+        browser_hold_at = 0;
         physical_keys = pressed_this_frame = held_buttons = gameplay_buttons = 0;
         return;
     }
@@ -2436,6 +2768,8 @@ static void read_event(Event e) {
     if (down) {
         if (held_buttons & bit) return;
         held_buttons |= bit;
+        if (browser_hold_at) touching_flow = false;
+        browser_hold_at = 0;
         dismiss_browser_actions();
         if (screen == GAME) {
             gameplay_buttons |= bit;
@@ -2771,8 +3105,8 @@ static int smoke_test(const char *path) {
     if (screen != BROWSER || emulation_active() || allow_video || core != previous_core ||
         slot != 3) { close_rom(); return 27; }
     const int toolbar_y = BROWSER_BUTTON_Y + 13;
-    read_touch('d', EXIT_X + 25, toolbar_y);
-    read_touch('u', EXIT_X + 25, toolbar_y);
+    read_touch('d', GET_GAMES_X + 25, toolbar_y);
+    read_touch('u', GET_GAMES_X + 25, toolbar_y);
     if (screen != BROWSER || browser_actions_open) { close_rom(); return 40; }
     read_touch('d', MORE_TOUCH_X + 3, 5);
     read_touch('u', MORE_TOUCH_X - 17, 25);
@@ -2820,12 +3154,56 @@ static int smoke_test(const char *path) {
     read_touch('u', APP_MENU_X + 25, toolbar_y);
     if (screen != APP_MENU || browser_actions_open) { close_rom(); return 44; }
     go_back();
+    RomShelf *saved_shelf = shelf;
+    RomShelf saved_console = shelves[SYSTEM_GBA];
+    Rom saved_rom = roms[0];
+    bool saved_list = library.list;
+    shelf = &shelves[SYSTEM_GBA];
+    *shelf = (RomShelf){.end = 1};
+    roms[0] = (Rom){.name = "Hold test.gba", .title_length = 9, .system = SYSTEM_GBA};
+    for (int list = 0; list < 2; ++list) {
+        library.list = list;
+        set_screen(BROWSER);
+        int x = WIDTH / 2, y = list ? LIST_TOP + 12 : HEIGHT / 2;
+        read_touch('d', x, y);
+        if (!browser_hold_at || update_browser_hold(browser_hold_at - 1) != browser_hold_at ||
+            screen != BROWSER) { close_rom(); return 60; }
+        uint64_t expires = browser_hold_at;
+        read_touch('m', x + ROM_HOLD_SLOP, y);
+        update_browser_hold(expires);
+        if (screen != BROWSER) { close_rom(); return 61; }
+        set_screen(BROWSER);
+        read_touch('d', x, y);
+        update_browser_hold(browser_hold_at);
+        read_touch('u', x, y);
+        if (screen != ROM_ACTIONS || strcmp(delete_rom.name, "Hold test.gba")) {
+            close_rom(); return 62;
+        }
+        delete_saves = true;
+        activate_menu(0);
+        if (screen != DELETE_ROM || delete_saves || menu_focus != 1) { close_rom(); return 63; }
+        activate_menu(2);
+        if (screen != CONFIRM_DELETE || menu_focus != 0) { close_rom(); return 64; }
+        activate_menu(0);
+        go_back();
+    }
+    library.list = saved_list;
+    roms[0] = saved_rom;
+    *shelf = saved_console;
+    shelf = saved_shelf;
+    set_screen(BROWSER);
     read_touch('d', MORE_DOTS_X, toolbar_y);
     read_touch('u', MORE_DOTS_X, toolbar_y);
-    read_touch('d', EXIT_X + 25, BROWSER_BUTTON_Y + 13);
-    read_touch('u', EXIT_X + 25, BROWSER_BUTTON_Y + 13);
-    if (quitting || screen != GAME || !running || core != previous_core ||
-        slot != 3) { close_rom(); return 29; }
+    read_touch('d', GET_GAMES_X + 25, BROWSER_BUTTON_Y + 13);
+    read_touch('u', GET_GAMES_X + 25, BROWSER_BUTTON_Y + 13);
+    if (quitting || screen != GET_GAMES || !running) { close_rom(); return 29; }
+    go_back();
+    set_screen(APP_MENU);
+    activate_menu(6);
+    if (!quitting) { close_rom(); return 58; }
+    quitting = 0;
+    activate_menu(5);
+    if (screen != GAME || core != previous_core || slot != 3) { close_rom(); return 59; }
     set_screen(GAME);
     fast = 1;
     for (unsigned i = 0; i < sizeof speeds / sizeof speeds[0]; ++i) {
@@ -2908,7 +3286,7 @@ static void log_launch(void) {
     sigaction(SIGSEGV, &action, NULL);
     sigaction(SIGABRT, &action, NULL);
     sigaction(SIGFPE, &action, NULL);
-    fprintf(stderr, "\nq2-boy 0.3.8, engine=%s\n",
+    fprintf(stderr, "\nq2-boy 0.4.0, engine=%s\n",
             use_dynarec ? "dynamic recompiler (opt-in)" : "interpreter");
     FILE *memory = fopen("/proc/meminfo", "r");
     if (memory) {
@@ -2991,6 +3369,7 @@ int main(int argc, char **argv) {
         for (int i = 0; i < 128 && platform_event(&e); ++i) if (!native_yielded) read_event(e);
         uint64_t now = clock_ns();
         audio_poll(now);
+        uint64_t itch_at = update_itch(now);
         now = clock_ns();
         if (screen == GAME) press_held_edge_button(now);
         if (notice_end && now >= notice_end) { notice_end = 0; dirty = 1; }
@@ -3034,6 +3413,7 @@ int main(int argc, char **argv) {
             next_save = now + 20000000000ull;
         }
         platform_audio_service();
+        uint64_t hold_at = update_browser_hold(now);
         uint64_t browse_at = update_browser(now);
         if (dirty && !native_yielded) {
             uint64_t started = performance_log ? clock_ns() : 0;
@@ -3044,13 +3424,14 @@ int main(int argc, char **argv) {
             }
         }
         uint64_t deadline = advance ? next_frame : UINT64_MAX;
-        deadline = sooner(deadline, sooner(browse_at, audio_deadline()));
+        deadline = sooner(deadline, sooner(sooner(hold_at, browse_at), audio_deadline()));
         if (notice_end) deadline = sooner(deadline, notice_end);
         if (running) deadline = sooner(deadline, next_save);
         if (platform_audio_pending()) deadline = sooner(deadline, now + 3000000ull);
-        deadline = sooner(deadline, display_deadline(now));
+        deadline = sooner(deadline, sooner(itch_at, display_deadline(now)));
         platform_wait(deadline);
     }
+    itch_stop(&itch_job);
     close_rom();
     close_shared_cores();
     platform_close();

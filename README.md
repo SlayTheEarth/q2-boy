@@ -51,6 +51,21 @@ Legacy save files are copied to the system folders with their original
 filenames. Existing destination files take priority. If any old files
 remain, Pocket Boy can still read them from the flat folders.
 
+## Get Games and manage ROMs
+
+On a Q2 connected to Wi-Fi, open the ROM library's **… → Get Games**.
+Browse itch.io by console (GB, GBC or GBA) and filter by free or paid. Pocket
+Boy checks the project before offering a free download, imports one compatible
+ROM from a raw file or ZIP, and saves the cover as a matching PNG beside it.
+**View on itch.io** shows a QR code for the creator's page, including paid
+games, optional donations, and projects without a compatible download.
+
+To remove a file, touch and hold its cover or list row, then choose **Delete ROM**. Review the
+filename, optionally check **Also delete save data**, then continue to the
+separate confirmation. The checkbox starts unchecked. Save RAM, RTC data,
+and save states are kept unless you check it. A ROM open in the emulator
+must be closed before you can delete it.
+
 ## ROM library and artwork
 
 Pocket Boy opens on **Recently Played**, with up to ten games in launch order,
@@ -64,10 +79,9 @@ its favorite status. A white outline means unpinned and a red heart means pinned
 
 Turn the wheel, swipe horizontally, or use Previous and Next to browse games
 within a shelf. Tap a side cover to select it. Press Centre or tap the center
-cover to launch it. Tap the top-right area around **⋯** to show **Exit**, **Menu**,
+cover to launch it. Tap the top-right area around **⋯** to show **Get Games**, **Menu**,
 and **Sort**. Tap outside the row to hide it. Turning the wheel or pressing a
-physical button also hides it and carries out the usual action. **Exit** becomes
-**Resume** when a game is loaded. The game pauses while you browse or use a menu.
+physical button also hides it and carries out the usual action. Open **Menu** to exit Pocket Boy or resume a loaded game. The game pauses while you browse or use a menu.
 
 Pocket Boy preloads nearby artwork and caches up to 64 resized
 covers on the SD card. **Refresh ROMs and covers** clears the cache. Compatible

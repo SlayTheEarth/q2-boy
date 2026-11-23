@@ -47,6 +47,18 @@ FCEUMM="$PWD/deps/fceumm" SNES9X2005="$PWD/deps/snes9x2005" \
 For an SD release, zip the contents of `dist` at the archive root,
 including the hidden `.boy` directory.
 
+Build the itch.io helper with Go 1.23 or later and Python 3. The Go packages
+are vendored in `src/itch-helper`.
+
+```sh
+sh src/build-itch.sh dist/.boy/q2-boy-itch
+cat /usr/share/ca-certificates/mozilla/*.crt > dist/.boy/itch-ca.pem
+```
+
+The certificate command uses Debian's Mozilla root certificates. Include
+the corresponding certificate attribution and Go license in a release source
+archive. Use root certificates from a maintained source for other build systems.
+
 ## Optional firmware bridge
 
 On firmware with the upstream `audio2` card-app capability, Pocket Boy uses
